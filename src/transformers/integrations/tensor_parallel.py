@@ -585,7 +585,7 @@ class ReplicateParallel(TensorParallelLayer):
     This class is used to replicate computation in a TP layer (used in SP regions when we don't use sequence parallelism for example)
     """
 
-    def __init__(self, use_dtensor=True, use_local_output=True, **kwargs):
+    def __init__(self, use_dtensor=False, use_local_output=True, **kwargs):
         super().__init__(**kwargs)
         self.input_layouts = (Replicate(),)
         self.output_layouts = (Replicate(),)

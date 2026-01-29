@@ -18,10 +18,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ...configuration_utils import PreTrainedConfig
-from ...modeling_rope_utils import RopeParameters
+from ...modeling_rope_utils import RopeParameters, RotaryEmbeddingConfigMixin
 
 
-class DeepseekV32Config(PreTrainedConfig):
+class DeepseekV32Config(PreTrainedConfig, RotaryEmbeddingConfigMixin):
     r"""
     This is the configuration class to store the configuration of a [`DeepseekV32Model`]. It is used to instantiate a DeepSeek
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -121,11 +121,11 @@ class DeepseekV32Config(PreTrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
 
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.q_a_proj": "colwise",
-        "layers.*.self_attn.q_b_proj": "colwise",
-        "layers.*.self_attn.kv_b_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
+        # "layers.*.self_attn.q_proj": "local_colwise",
+        # "layers.*.self_attn.q_b_proj": "local_colwise",
+        # "layers.*.self_attn.kv_b_proj": "local_colwise",
+        # "layers.*.self_attn.o_proj": "local_rowwise",
+        "layers.*.self_attn": "gather",
         "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
         "layers.*.mlp.experts.down_proj": "grouped_gemm",
         "layers.*.mlp.experts": "gather",

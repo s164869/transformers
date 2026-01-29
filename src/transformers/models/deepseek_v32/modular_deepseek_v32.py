@@ -29,13 +29,12 @@ from ..deepseek_v2.modeling_deepseek_v2 import (
     DeepseekV2PreTrainedModel,
     DeepseekV2RMSNorm,
     DeepseekV2RotaryEmbedding,
-    apply_rotary_emb
 )
-
+from ...modeling_rope_utils import RotaryEmbeddingConfigMixin
 # TODO
 # Use our rope and convert qkv with rope rotation to benefit from kernels
 
-class DeepseekV32Config(DeepseekV2Config):
+class DeepseekV32Config(DeepseekV2Config, RotaryEmbeddingConfigMixin):
     def __init__(self, index_n_heads=64, index_head_dim=128, index_topk=2048, **super_kwargs):
         super().__init__(**super_kwargs)
         self.index_n_heads = index_n_heads
