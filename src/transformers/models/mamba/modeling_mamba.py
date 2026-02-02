@@ -23,6 +23,7 @@ from torch.nn import CrossEntropyLoss
 
 from ... import initialization as init
 from ...activations import ACT2FN
+from ...cache_utils import Cache, CacheLayerMixin
 from ...configuration_utils import PreTrainedConfig
 from ...generation import GenerationMixin
 from ...integrations import lazy_load_kernel
@@ -45,7 +46,134 @@ else:
     pscan = None
 
 
-class MambaCache:
+class _MambaConvLayer(CacheLayerMixin):
+    is_compileable = True
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        intermediate_size: int,
+        conv_kernel_size: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None = None,
+    ):
+        super().__init__()
+        self.max_batch_size = max_batch_size
+        self.intermediate_size = intermediate_size
+        self.conv_kernel_size = conv_kernel_size
+        self._dtype = dtype
+        self.device = torch.device(device) if device is not None else None
+
+    def lazy_initialization(self, states: torch.Tensor) -> None:
+        device = self.device if self.device is not None else states.device
+        dtype = self._dtype if self._dtype is not None else states.dtype
+        self.inner = torch.zeros(
+            (self.max_batch_size, self.intermediate_size, self.conv_kernel_size), device=device, dtype=dtype
+        )
+        if not is_torchdynamo_compiling():
+            torch._dynamo.mark_static_address(self.inner)
+        self.is_initialized = True
+
+    def update(self, states: torch.Tensor, cache_kwargs: dict[str, Any] | None = None) -> torch.Tensor:
+        if not self.is_initialized:
+            self.lazy_initialization(states)
+        if self.inner.device != states.device:
+            self.inner = self.inner.to(states.device)
+
+        cache_position = cache_kwargs.get("cache_position") if cache_kwargs is not None else None
+        if cache_position is None:
+            raise ValueError("`cache_position` must be provided to update the Mamba convolution cache.")
+        cache_position = cache_position.clamp(0, self.conv_kernel_size - 1).to(self.inner.device)
+
+        rolled_state = self.inner.roll(shifts=-1, dims=-1)
+        self.inner.copy_(rolled_state)
+        self.inner[:, :, cache_position] = states.to(device=self.inner.device, dtype=self.inner.dtype)
+        return self.inner
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        kv_length = cache_position.shape[0] if cache_position is not None else self.conv_kernel_size
+        return kv_length, 0
+
+    def get_seq_length(self) -> int:
+        return self.conv_kernel_size if self.is_initialized else 0
+
+    def get_max_cache_shape(self) -> int:
+        return self.conv_kernel_size
+
+    def crop(self, max_length: int) -> None:
+        # No-op: the convolution cache has a fixed kernel size.
+        return
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        if self.is_initialized:
+            self.inner = self.inner.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        if self.is_initialized:
+            self.inner = self.inner[indices, ...]
+
+
+class _MambaSSMLayer(CacheLayerMixin):
+    is_compileable = True
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        intermediate_size: int,
+        ssm_state_size: int,
+        dtype: torch.dtype,
+        device: torch.device | str | None = None,
+    ):
+        super().__init__()
+        self.max_batch_size = max_batch_size
+        self.intermediate_size = intermediate_size
+        self.ssm_state_size = ssm_state_size
+        self._dtype = dtype
+        self.device = torch.device(device) if device is not None else None
+
+    def lazy_initialization(self, states: torch.Tensor) -> None:
+        device = self.device if self.device is not None else states.device
+        dtype = self._dtype if self._dtype is not None else states.dtype
+        self.inner = torch.zeros(
+            (self.max_batch_size, self.intermediate_size, self.ssm_state_size), device=device, dtype=dtype
+        )
+        if not is_torchdynamo_compiling():
+            torch._dynamo.mark_static_address(self.inner)
+        self.is_initialized = True
+
+    def update(self, states: torch.Tensor, cache_kwargs: dict[str, Any] | None = None) -> torch.Tensor:
+        if not self.is_initialized:
+            self.lazy_initialization(states)
+        if self.inner.device != states.device:
+            self.inner = self.inner.to(states.device)
+        self.inner.zero_()
+        self.inner += states.to(device=self.inner.device, dtype=self.inner.dtype)
+        return self.inner
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        kv_length = cache_position.shape[0] if cache_position is not None else 1
+        return kv_length, 0
+
+    def get_seq_length(self) -> int:
+        return self.ssm_state_size if self.is_initialized else 0
+
+    def get_max_cache_shape(self) -> int:
+        return self.ssm_state_size
+
+    def crop(self, max_length: int) -> None:
+        # No-op: the SSM state has a fixed size.
+        return
+
+    def batch_repeat_interleave(self, repeats: int) -> None:
+        if self.is_initialized:
+            self.inner = self.inner.repeat_interleave(repeats, dim=0)
+
+    def batch_select_indices(self, indices: torch.Tensor) -> None:
+        if self.is_initialized:
+            self.inner = self.inner[indices, ...]
+
+
+class MambaCache(Cache):
     """
     Cache for mamba model which does not have attention mechanism and key value states.
 
@@ -79,7 +207,7 @@ class MambaCache:
         ```
     """
 
-    is_compileable = True
+    cache_state_names = ("conv_states", "ssm_states")
 
     # TODO (joao): add layer_device_map arg and update code in `generate` accordingly
     def __init__(
@@ -95,57 +223,51 @@ class MambaCache:
         self.ssm_state_size = config.state_size
         self.conv_kernel_size = config.conv_kernel
 
-        self.conv_states: list[torch.Tensor] = []
-        self.ssm_states: list[torch.Tensor] = []
-        device = torch.device(device) if device is not None else None
-        for _ in range(config.num_hidden_layers):
-            conv_state: torch.Tensor = torch.zeros(
-                self.max_batch_size,
-                self.intermediate_size,
-                self.conv_kernel_size,
-                device=device,
-                dtype=self._dtype,
-            )
-            ssm_state: torch.Tensor = torch.zeros(
-                self.max_batch_size,
-                self.intermediate_size,
-                self.ssm_state_size,
-                device=device,
-                dtype=self._dtype,
-            )
+        conv_layers = [
+            _MambaConvLayer(max_batch_size, self.intermediate_size, self.conv_kernel_size, dtype, device)
+            for _ in range(config.num_hidden_layers)
+        ]
+        ssm_layers = [
+            _MambaSSMLayer(max_batch_size, self.intermediate_size, self.ssm_state_size, dtype, device)
+            for _ in range(config.num_hidden_layers)
+        ]
+        super().__init__(
+            layers={"conv_states": conv_layers, "ssm_states": ssm_layers},
+            offloading=False,
+            offload_only_non_sliding=True,
+            state_names=self.cache_state_names,
+        )
 
-            torch._dynamo.mark_static_address(conv_state)
-            torch._dynamo.mark_static_address(ssm_state)
-            self.conv_states.append(conv_state)
-            self.ssm_states.append(ssm_state)
+        # Eagerly initialize to keep static addresses stable for compile.
+        device = torch.device(device) if device is not None else None
+        fake_conv_state = torch.zeros(
+            self.max_batch_size, self.intermediate_size, self.conv_kernel_size, device=device, dtype=self._dtype
+        )
+        fake_ssm_state = torch.zeros(
+            self.max_batch_size, self.intermediate_size, self.ssm_state_size, device=device, dtype=self._dtype
+        )
+        for layer in conv_layers:
+            layer.lazy_initialization(fake_conv_state)
+        for layer in ssm_layers:
+            layer.lazy_initialization(fake_ssm_state)
+
+    @property
+    def conv_states(self) -> list[torch.Tensor]:
+        return [layer.inner for layer in self.state_caches["conv_states"].layers]
+
+    @property
+    def ssm_states(self) -> list[torch.Tensor]:
+        return [layer.inner for layer in self.state_caches["ssm_states"].layers]
 
     def update_conv_state(
         self, layer_idx: int, new_conv_state: torch.Tensor, cache_position: torch.LongTensor
     ) -> torch.Tensor:
-        # This `if` blocks is only reached in multigpu and if `layer_device_map` is not passed. It is used
-        # when the cache is initialized in the forward pass (e.g. Mamba)
-        if self.conv_states[layer_idx].device != new_conv_state.device:
-            self.conv_states[layer_idx] = self.conv_states[layer_idx].to(new_conv_state.device)
-
-        conv_state = self.conv_states[layer_idx]
-        cache_position = cache_position.clamp(0, self.conv_kernel_size - 1)
-
-        conv_state = conv_state.roll(shifts=-1, dims=-1)
-        conv_state[:, :, cache_position] = new_conv_state.to(device=conv_state.device, dtype=conv_state.dtype)
-        self.conv_states[layer_idx].zero_()
-        self.conv_states[layer_idx] += conv_state
-        return self.conv_states[layer_idx]
+        return self.state_caches["conv_states"].update(
+            new_conv_state, layer_idx, cache_kwargs={"cache_position": cache_position}
+        )
 
     def update_ssm_state(self, layer_idx: int, new_ssm_state: torch.Tensor):
-        self.ssm_states[layer_idx].zero_()
-        self.ssm_states[layer_idx] += new_ssm_state.to(self.ssm_states[layer_idx].device)
-        return self.ssm_states[layer_idx]
-
-    def reset(self):
-        for layer_idx in range(len(self.conv_states)):
-            # In-place ops prevent breaking the static address
-            self.conv_states[layer_idx].zero_()
-            self.ssm_states[layer_idx].zero_()
+        return self.state_caches["ssm_states"].update(new_ssm_state, layer_idx, cache_kwargs=None)
 
 
 class MambaMixer(nn.Module):
