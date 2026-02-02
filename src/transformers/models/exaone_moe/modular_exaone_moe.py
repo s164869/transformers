@@ -86,10 +86,12 @@ class ExaoneMoeConfig(Exaone4Config, RotaryEmbeddingConfigMixin):
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if ``config.is_decoder=True``.
-        bos_token_id (`int`, *optional*, defaults to 0):
+        bos_token_id (`int`, *optional*, defaults to 1):
             Beginning of stream token id.
-        eos_token_id (`int`, *optional*, defaults to 2):
+        eos_token_id (`int`, *optional*, defaults to 53):
             End of stream token id.
+        pad_token_id (`int`, *optional*, defaults to 0):
+            Padding token id.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether to tie weight embeddings
         rope_parameters (`RopeParameters`, *optional*):
@@ -163,9 +165,9 @@ class ExaoneMoeConfig(Exaone4Config, RotaryEmbeddingConfigMixin):
         initializer_range=0.02,
         rms_norm_eps=1e-5,
         use_cache=True,
-        bos_token_id=0,
-        eos_token_id=2,
-        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=53,
+        pad_token_id=0,
         tie_word_embeddings=False,
         rope_parameters=None,
         attention_dropout=0.0,

@@ -22,7 +22,6 @@ from transformers import (
 from transformers.testing_utils import (
     cleanup,
     require_torch,
-    require_torch_large_accelerator,
     slow,
     torch_device,
 )
@@ -81,11 +80,10 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
         return cls.model
 
     @slow
-    @require_torch_large_accelerator
     def test_model_logits(self):
         input_ids = [405, 7584, 36608, 892, 95714, 2907, 1492, 758, 373, 582]
         model = self.get_model()
-        input_ids = torch.tensor([input_ids]).to(model.model.embed_tokens.weight.device)
+        input_ids = torch.tensor([input_ids]).to(model.device)
         with torch.no_grad():
             out = model(input_ids).logits.float().cpu()
 
@@ -105,7 +103,7 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
         tokenizer = AutoTokenizer.from_pretrained(self.TEST_MODEL_ID)
         model = self.get_model()
 
-        input_ids = tokenizer(prompt, return_tensors="pt").to(model.model.embed_tokens.weight.device)
+        input_ids = tokenizer(prompt, return_tensors="pt").to(model.device)
 
         with torch.no_grad():
             generated_ids = model.generate(**input_ids, max_new_tokens=20, do_sample=False)
@@ -113,13 +111,12 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
         self.assertEqual(EXPECTED_TEXT, text)
 
     @slow
-    @require_torch_large_accelerator
     def test_model_generation_beyond_sliding_window_flash(self):
         EXPECTED_OUTPUT_TOKEN_IDS = [373, 686, 373, 115708, 373, 885]
         input_ids = [72861, 2711] + [21605, 2711] * 2048
         model = self.get_model()
-        model.config._attn_implementation = "flash_attention_2"
-        input_ids = torch.tensor([input_ids]).to(model.model.embed_tokens.weight.device)
+        model.set_attn_implementation("flash_attention_2")
+        input_ids = torch.tensor([input_ids]).to(model.device)
 
         with torch.no_grad():
             generated_ids = model.generate(input_ids, max_new_tokens=6, do_sample=False)
