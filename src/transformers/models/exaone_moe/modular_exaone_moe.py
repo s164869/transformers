@@ -21,7 +21,6 @@ from ... import initialization as init
 from ...cache_utils import Cache
 from ...configuration_utils import PreTrainedConfig, layer_type_validation
 from ...modeling_outputs import CausalLMOutputWithPast
-from ...modeling_rope_utils import RotaryEmbeddingConfigMixin
 from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, is_grouped_mm_available
@@ -43,7 +42,7 @@ from ..olmoe.modeling_olmoe import (
 from ..qwen2_moe.modeling_qwen2_moe import Qwen2MoeMLP
 
 
-class ExaoneMoeConfig(Exaone4Config, RotaryEmbeddingConfigMixin):
+class ExaoneMoeConfig(Exaone4Config):
     model_type = "exaone_moe"
 
     r"""
@@ -230,13 +229,12 @@ class ExaoneMoeConfig(Exaone4Config, RotaryEmbeddingConfigMixin):
             ]
         layer_type_validation(self.mlp_layer_types, self.num_hidden_layers, attention=False)
 
-        PreTrainedConfig.__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.tie_word_embeddings = tie_word_embeddings
+
+        PreTrainedConfig.__init__(**kwargs)
 
 
 class ExaoneMoeAttention(Exaone4Attention):
@@ -304,7 +302,7 @@ class ExaoneMoePreTrainedModel(Exaone4PreTrainedModel):
             init.normal_(module.down_proj, mean=0.0, std=self.config.initializer_range)
 
 
-class ExaoneMoeModel(Exaone4Model, ExaoneMoePreTrainedModel):
+class ExaoneMoeModel(Exaone4Model):
     pass
 
 

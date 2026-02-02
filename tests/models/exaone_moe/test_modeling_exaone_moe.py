@@ -15,12 +15,15 @@
 
 import unittest
 
+from pytest import mark
+
 from transformers import (
     AutoTokenizer,
     is_torch_available,
 )
 from transformers.testing_utils import (
     cleanup,
+    require_flash_attn,
     require_torch,
     slow,
     torch_device,
@@ -46,9 +49,10 @@ class ExaoneMoeModelTester(CausalLMModelTester):
 @require_torch
 class ExaoneMoeModelTest(CausalLMModelTest, unittest.TestCase):
     model_tester_class = ExaoneMoeModelTester
-    model_split_percents = [0.5, 0.6]
+    model_split_percents = [0.5, 0.8, 0.9]
 
 
+@slow
 @require_torch
 class ExaoneMoeIntegrationTest(unittest.TestCase):
     TEST_MODEL_ID = "nuxlear/EXAONE-MoE-Dummy-7B-A1B"
@@ -79,7 +83,6 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
 
         return cls.model
 
-    @slow
     def test_model_logits(self):
         input_ids = [405, 7584, 36608, 892, 95714, 2907, 1492, 758, 373, 582]
         model = self.get_model()
@@ -96,7 +99,6 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
         torch.testing.assert_close(out.mean(-1), EXPECTED_MEAN, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(out[0, 0, :10], EXPECTED_SLICE, atol=1e-4, rtol=1e-4)
 
-    @slow
     def test_model_generation_sdpa(self):
         EXPECTED_TEXT = "The deep learning is 100% accurate.\n\nThe 100% accurate is 100%"
         prompt = "The deep learning is "
@@ -110,7 +112,8 @@ class ExaoneMoeIntegrationTest(unittest.TestCase):
         text = tokenizer.decode(generated_ids[0], skip_special_tokens=False)
         self.assertEqual(EXPECTED_TEXT, text)
 
-    @slow
+    @require_flash_attn
+    @mark.flash_attn_test
     def test_model_generation_beyond_sliding_window_flash(self):
         EXPECTED_OUTPUT_TOKEN_IDS = [373, 686, 373, 115708, 373, 885]
         input_ids = [72861, 2711] + [21605, 2711] * 2048

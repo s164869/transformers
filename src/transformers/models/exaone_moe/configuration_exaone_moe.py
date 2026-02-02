@@ -19,10 +19,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from ...configuration_utils import PreTrainedConfig, layer_type_validation
-from ...modeling_rope_utils import RotaryEmbeddingConfigMixin
 
 
-class ExaoneMoeConfig(PreTrainedConfig, RotaryEmbeddingConfigMixin):
+class ExaoneMoeConfig(PreTrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`ExaoneMoeModel`]. It is used to
     instantiate a EXAONE MoE model according to the specified arguments, defining the model architecture. Instantiating a
@@ -225,13 +224,12 @@ class ExaoneMoeConfig(PreTrainedConfig, RotaryEmbeddingConfigMixin):
             ]
         layer_type_validation(self.mlp_layer_types, self.num_hidden_layers, attention=False)
 
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
+        self.tie_word_embeddings = tie_word_embeddings
+
+        super().__init__(**kwargs)
 
 
 __all__ = ["ExaoneMoeConfig"]
