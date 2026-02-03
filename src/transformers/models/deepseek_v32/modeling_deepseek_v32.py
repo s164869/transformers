@@ -261,11 +261,11 @@ def index_no_scaling(q: torch.Tensor, _scale, k: torch.Tensor) -> torch.Tensor:
     dot = torch.matmul(k, q_flat.transpose(-2, -1))          # (B, S, S*H)
 
     # Reshape into (B, s_key, t_query, head) then permute to (B, t, s, h)
-    dot = dot.view(B, S, S, H).transpose(1, 2)               # (B, S, S, H) as (t, s, h)
+    dot = dot.view(B, -1, S, H).transpose(1, 2)               # (B, S, S, H) as (t, s, h)
     contrib = torch.relu(dot)                                # (B, S, S, H)\
     # Apply head weights w_{t,h}: broadcast over s
     contrib = contrib * _scale.unsqueeze(2)                       # w: (B,S,H) -> (B,S,1,H)
-    mask = torch.tril(torch.ones(S, S, device=q.device, dtype=torch.bool), diagonal=-1)  # s < t
+    mask = torch.tril(torch.ones(S, k.shape[1], device=q.device, dtype=torch.bool), diagonal=-1)  # s < t
     contrib = contrib.masked_fill(~mask[None, :, :, None], 0.0)
     return contrib.sum(dim=-1)
 

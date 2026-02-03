@@ -789,7 +789,7 @@ class Gather(TensorParallelLayer):
         return hidden_states, topk_indices, topk_weights
 
     def _prepare_output_fn(self, mod, outputs, device_mesh):
-        return all_gather(outputs, device_mesh)
+        return all_reduce_forward(outputs, device_mesh)
 
 
 
