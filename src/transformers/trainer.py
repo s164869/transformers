@@ -69,6 +69,7 @@ from .integrations.deepspeed import (
     propagate_args_to_deepspeed,
 )
 from .integrations.peft import MIN_PEFT_VERSION
+from .integrations.fsdp import get_fsdp_ckpt_kwargs, update_fsdp_plugin_peft
 from .integrations.tpu import tpu_spmd_dataloader
 from .modelcard import TrainingSummary
 from .modeling_utils import PreTrainedModel, unwrap_model
@@ -105,6 +106,7 @@ from .trainer_pt_utils import (
     nested_gather,
     reissue_pt_warnings,
     remove_dummy_checkpoint,
+    safe_globals,
     set_rng_state_for_device,
 )
 from .trainer_utils import (
@@ -234,32 +236,6 @@ def _is_peft_model(model):
         classes_to_check = (PeftModel, PeftMixedModel)
         return isinstance(model, classes_to_check)
     return False
-
-
-def _get_fsdp_ckpt_kwargs():
-    if "adapter_only" in list(inspect.signature(save_fsdp_model).parameters):
-        return {"adapter_only": True}
-    else:
-        return {}
-
-
-def safe_globals():
-    # Starting from version 2.4 PyTorch introduces a check for the objects loaded
-    # with torch.load(weights_only=True). Starting from 2.6 weights_only=True becomes
-    # a default and requires allowlisting of objects being loaded.
-    # See: https://github.com/pytorch/pytorch/pull/137602
-    # See: https://pytorch.org/docs/stable/notes/serialization.html#torch.serialization.add_safe_globals
-    # See: https://github.com/huggingface/accelerate/pull/3036
-    if version.parse(torch.__version__).release < version.parse("2.6").release:
-        return contextlib.nullcontext()
-
-    np_core = np._core if version.parse(np.__version__) >= version.parse("2.0.0") else np.core
-    allowlist = [np_core.multiarray._reconstruct, np.ndarray, np.dtype]
-    # numpy >1.25 defines numpy.dtypes.UInt32DType, but below works for
-    # all versions of numpy
-    allowlist += [type(np.dtype(np.uint32))]
-
-    return torch.serialization.safe_globals(allowlist)
 
 
 if TYPE_CHECKING:
@@ -2308,7 +2284,8 @@ class Trainer:
         if delay_optimizer_creation:
             if use_accelerator_prepare:
                 # configure fsdp plugin for qlora if any
-                self._fsdp_qlora_plugin_updates()
+                if self.is_fsdp_enabled and _is_peft_model(model):
+                    update_fsdp_plugin_peft(self.model, self.accelerator)
                 if self.accelerator.mixed_precision != "fp8":
                     self.model = self.accelerator.prepare(self.model)
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
@@ -2783,7 +2760,7 @@ class Trainer:
                     self.accelerator,
                     model,
                     resume_from_checkpoint,
-                    **_get_fsdp_ckpt_kwargs(),
+                    **get_fsdp_ckpt_kwargs(),
                 )
             else:
                 # We load the model state dict on the CPU to avoid an OOM error.
@@ -2851,7 +2828,7 @@ class Trainer:
                 self.accelerator,
                 model,
                 self.state.best_model_checkpoint,
-                **_get_fsdp_ckpt_kwargs(),
+                **get_fsdp_ckpt_kwargs(),
             )
         elif (
             os.path.exists(best_model_path)
@@ -3246,7 +3223,7 @@ class Trainer:
         elif self.is_fsdp_enabled:
             # save fsdp specific ckpt for resuming from ckpt
             save_fsdp_model(
-                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **_get_fsdp_ckpt_kwargs()
+                self.accelerator.state.fsdp_plugin, self.accelerator, self.model, output_dir, **get_fsdp_ckpt_kwargs()
             )
             save_fsdp_optimizer(
                 self.accelerator.state.fsdp_plugin, self.accelerator, self.optimizer, self.model, output_dir
@@ -3356,7 +3333,7 @@ class Trainer:
                             self.optimizer,
                             self.model,
                             checkpoint,
-                            **_get_fsdp_ckpt_kwargs(),
+                            **get_fsdp_ckpt_kwargs(),
                         )
                     else:
                         check_torch_load_is_safe()
@@ -5037,21 +5014,6 @@ class Trainer:
             and "SHARDED_STATE_DICT" in str(self.accelerator.state.fsdp_plugin.state_dict_type)
         ):
             raise ValueError("save_only_model option is not compatible with FSDP state dict type 'SHARDED_STATE_DICT'")
-
-    def _fsdp_qlora_plugin_updates(self):
-        if self.is_fsdp_enabled and _is_peft_model(self.model):
-            from peft import PeftConfig
-            from peft.utils.other import fsdp_auto_wrap_policy
-
-            if isinstance(self.model.active_peft_config, PeftConfig):
-                self.accelerator.state.fsdp_plugin.auto_wrap_policy = fsdp_auto_wrap_policy(self.model)
-            if (
-                getattr(self.model, "quantization_method", None) == QuantizationMethod.BITS_AND_BYTES
-                and self.model.hf_quantizer.quantization_config.bnb_4bit_quant_storage.is_floating_point
-            ):
-                self.accelerator.state.fsdp_plugin.set_mixed_precision(
-                    self.model.hf_quantizer.quantization_config.bnb_4bit_quant_storage, override=True
-                )
 
     def _get_num_items_in_batch(self, batch_samples: list, device: torch.device) -> torch.Tensor | int | None:
         """
