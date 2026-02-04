@@ -2681,9 +2681,7 @@ class Trainer:
         self.log(metrics)
 
         run_dir = self._get_output_dir(trial)
-        checkpoints_sorted = sort_checkpoints(
-            output_dir=run_dir, use_mtime=False, best_model_checkpoint=self.state.best_model_checkpoint
-        )
+        checkpoints_sorted = sort_checkpoints(output_dir=run_dir, best_model_checkpoint=self.state.best_model_checkpoint)
 
         # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
         if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:

@@ -3953,21 +3953,20 @@ class TrainerIntegrationTest(TestCasePlus, TrainerIntegrationCommon):
             for n in [20, 5, 15, 25, 10]:
                 os.makedirs(os.path.join(tmp_dir, f"{PREFIX_CHECKPOINT_DIR}-{n}"))
 
-            # Test basic sorting by step number
+            # Test sorting by step number (oldest first)
             sorted_cps = sort_checkpoints(tmp_dir)
             values = [int(re.match(f".*{PREFIX_CHECKPOINT_DIR}-([0-9]+)", d).groups()[0]) for d in sorted_cps]
             self.assertEqual(values, [5, 10, 15, 20, 25])
 
-            # Test sorting with best_model_checkpoint (should be moved to the end)
-            best_checkpoint = os.path.join(tmp_dir, f"{PREFIX_CHECKPOINT_DIR}-5")
-            sorted_cps = sort_checkpoints(tmp_dir, best_model_checkpoint=best_checkpoint)
+            # Test with best_model_checkpoint - moved to second-to-last to protect from deletion
+            best = os.path.join(tmp_dir, f"{PREFIX_CHECKPOINT_DIR}-5")
+            sorted_cps = sort_checkpoints(tmp_dir, best_model_checkpoint=best)
             values = [int(re.match(f".*{PREFIX_CHECKPOINT_DIR}-([0-9]+)", d).groups()[0]) for d in sorted_cps]
-            # checkpoint-5 should be moved towards the end (before the last one) to protect it from deletion
             self.assertEqual(values, [10, 15, 20, 5, 25])
 
-            # Test with best_model_checkpoint being the last one (should stay at the end)
-            best_checkpoint = os.path.join(tmp_dir, f"{PREFIX_CHECKPOINT_DIR}-25")
-            sorted_cps = sort_checkpoints(tmp_dir, best_model_checkpoint=best_checkpoint)
+            # Test with best_model_checkpoint already at end (stays at end)
+            best = os.path.join(tmp_dir, f"{PREFIX_CHECKPOINT_DIR}-25")
+            sorted_cps = sort_checkpoints(tmp_dir, best_model_checkpoint=best)
             values = [int(re.match(f".*{PREFIX_CHECKPOINT_DIR}-([0-9]+)", d).groups()[0]) for d in sorted_cps]
             self.assertEqual(values, [5, 10, 15, 20, 25])
 
