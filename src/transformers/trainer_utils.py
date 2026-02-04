@@ -23,10 +23,13 @@ import json
 import os
 import random
 import re
+import shutil
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -216,6 +219,110 @@ def get_last_checkpoint(folder):
     if len(checkpoints) == 0:
         return
     return os.path.join(folder, max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])))
+
+
+def sort_checkpoints(
+    output_dir: str,
+    checkpoint_prefix: str = PREFIX_CHECKPOINT_DIR,
+    use_mtime: bool = False,
+    best_model_checkpoint: str | None = None,
+) -> list[str]:
+    """
+    Get a sorted list of checkpoint directories.
+
+    Args:
+        output_dir (`str`):
+            The directory containing the checkpoints.
+        checkpoint_prefix (`str`, *optional*, defaults to `"checkpoint"`):
+            The prefix used for checkpoint directory names.
+        use_mtime (`bool`, *optional*, defaults to `False`):
+            Whether to sort by modification time instead of step number.
+        best_model_checkpoint (`str`, *optional*):
+            Path to the best model checkpoint. If provided, this checkpoint will be
+            moved to the end of the list to avoid deletion during rotation.
+
+    Returns:
+        `list[str]`: Sorted list of checkpoint directory paths.
+    """
+    ordering_and_checkpoint_path = []
+
+    glob_checkpoints = [str(x) for x in Path(output_dir).glob(f"{checkpoint_prefix}-*") if os.path.isdir(x)]
+
+    for path in glob_checkpoints:
+        if use_mtime:
+            ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+        else:
+            regex_match = re.match(f".*{checkpoint_prefix}-([0-9]+)", path)
+            if regex_match is not None and regex_match.groups() is not None:
+                ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
+    checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+    # mtime is not reliable on all filesystems, especially on some fuse fs in cloud environments
+    # so we check if the mtime is fake and fallback to numerical ordering if needed
+    if use_mtime and len(ordering_and_checkpoint_path) > 1:
+        mtime_diff = checkpoints_sorted[-1][0] - checkpoints_sorted[0][0]
+        if mtime_diff < 1.0:  # less than 1 second, which is almost impossible when mtime works fine
+            warnings.warn("mtime may not be reliable on this filesystem, falling back to numerical ordering")
+            return sort_checkpoints(
+                output_dir=output_dir,
+                checkpoint_prefix=checkpoint_prefix,
+                use_mtime=False,
+                best_model_checkpoint=best_model_checkpoint,
+            )
+    checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+
+    # Make sure we don't delete the best model.
+    if best_model_checkpoint is not None and str(Path(best_model_checkpoint)) in checkpoints_sorted:
+        best_model_index = checkpoints_sorted.index(str(Path(best_model_checkpoint)))
+        for i in range(best_model_index, len(checkpoints_sorted) - 2):
+            checkpoints_sorted[i], checkpoints_sorted[i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
+    return checkpoints_sorted
+
+
+def rotate_checkpoints(
+    output_dir: str,
+    save_total_limit: int | None = None,
+    best_model_checkpoint: str | None = None,
+    use_mtime: bool = False,
+    checkpoint_prefix: str = PREFIX_CHECKPOINT_DIR,
+) -> None:
+    """
+    Rotate checkpoints by deleting older ones when the total exceeds `save_total_limit`.
+
+    Args:
+        output_dir (`str`):
+            The directory containing the checkpoints.
+        save_total_limit (`int`, *optional*):
+            Maximum number of checkpoints to keep. If `None` or <= 0, no rotation is performed.
+        best_model_checkpoint (`str`, *optional*):
+            Path to the best model checkpoint. This checkpoint will be preserved during rotation.
+        use_mtime (`bool`, *optional*, defaults to `False`):
+            Whether to sort checkpoints by modification time instead of step number.
+        checkpoint_prefix (`str`, *optional*, defaults to `"checkpoint"`):
+            The prefix used for checkpoint directory names.
+    """
+    if save_total_limit is None or save_total_limit <= 0:
+        return
+
+    # Check if we should delete older checkpoint(s)
+    checkpoints_sorted = sort_checkpoints(
+        output_dir=output_dir,
+        checkpoint_prefix=checkpoint_prefix,
+        use_mtime=use_mtime,
+        best_model_checkpoint=best_model_checkpoint,
+    )
+    if len(checkpoints_sorted) <= save_total_limit:
+        return
+
+    # If save_total_limit=1 with load_best_model_at_end=True, we could end up deleting the last checkpoint, which
+    # we don't do to allow resuming.
+    if best_model_checkpoint is not None and save_total_limit == 1 and checkpoints_sorted[-1] != best_model_checkpoint:
+        save_total_limit = 2
+
+    number_of_checkpoints_to_delete = max(0, len(checkpoints_sorted) - save_total_limit)
+    checkpoints_to_be_deleted = checkpoints_sorted[:number_of_checkpoints_to_delete]
+    for checkpoint in checkpoints_to_be_deleted:
+        shutil.rmtree(checkpoint, ignore_errors=True)
 
 
 class IntervalStrategy(ExplicitEnum):
