@@ -417,55 +417,55 @@ def w8a8_block_fp8_matmul(
     Otherwise falls back to Triton.
     """
 
-    if _supports_cutlass(block_size, output_dtype):
-        kernel = _get_quantization_kernel()
-        if kernel is not None:
-            try:
-                # CUTLASS expects:
-                # - A: [M, K] row-major, float8_e4m3fn
-                # - B: [K, N] column-major, float8_e4m3fn
-                # - As: [M, K//128] M-major (activation scales)
-                # - Bs: [K//128, N//128] K-major (weight scales)
+    # if _supports_cutlass(block_size, output_dtype):
+    #     kernel = _get_quantization_kernel()
+    #     if kernel is not None:
+    #         try:
+    #             # CUTLASS expects:
+    #             # - A: [M, K] row-major, float8_e4m3fn
+    #             # - B: [K, N] column-major, float8_e4m3fn
+    #             # - As: [M, K//128] M-major (activation scales)
+    #             # - Bs: [K//128, N//128] K-major (weight scales)
 
-                # Reshape A to 2D if needed
-                original_shape = A.shape
-                M = A.numel() // A.shape[-1]
-                K = A.shape[-1]
-                N = B.shape[0]
+    #             # Reshape A to 2D if needed
+    #             original_shape = A.shape
+    #             M = A.numel() // A.shape[-1]
+    #             K = A.shape[-1]
+    #             N = B.shape[0]
 
-                # CUTLASS requires dimensions divisible by 16
-                if K % 16 != 0 or N % 16 != 0:
-                    raise ValueError(f"CUTLASS requires K ({K}) and N ({N}) divisible by 16")
+    #             # CUTLASS requires dimensions divisible by 16
+    #             if K % 16 != 0 or N % 16 != 0:
+    #                 raise ValueError(f"CUTLASS requires K ({K}) and N ({N}) divisible by 16")
 
-                A_2d = A.view(M, K).contiguous()
-                # B needs to be column-major for CUTLASS: [K, N] with stride(0)==1
-                # Our B is [N, K] row-major. Make it contiguous first, then transpose.
-                # B.contiguous() gives [N, K] with stride=(K,1)
-                # B.contiguous().t() gives [K, N] with stride=(1,K) which is column-major
-                # Do NOT call .contiguous() after .t() as it would make it row-major!
-                B_col_major = B.contiguous().t()
+    #             A_2d = A.view(M, K).contiguous()
+    #             # B needs to be column-major for CUTLASS: [K, N] with stride(0)==1
+    #             # Our B is [N, K] row-major. Make it contiguous first, then transpose.
+    #             # B.contiguous() gives [N, K] with stride=(K,1)
+    #             # B.contiguous().t() gives [K, N] with stride=(1,K) which is column-major
+    #             # Do NOT call .contiguous() after .t() as it would make it row-major!
+    #             B_col_major = B.contiguous().t()
 
-                # Scales need proper layout for CUTLASS blockwise:
-                # As should be [M, K//128] with M-major layout (stride(0)==1)
-                # Bs should be [K//128, N//128] with K-major layout (stride(0)==1)
+    #             # Scales need proper layout for CUTLASS blockwise:
+    #             # As should be [M, K//128] with M-major layout (stride(0)==1)
+    #             # Bs should be [K//128, N//128] with K-major layout (stride(0)==1)
 
-                # As: reshape to [M, K//128], then make M-major via t().contiguous().t()
-                As_2d = As.view(M, -1).contiguous()
-                As_2d = As_2d.t().contiguous().t()  # [M, K//128] with stride(0)==1
+    #             # As: reshape to [M, K//128], then make M-major via t().contiguous().t()
+    #             As_2d = As.view(M, -1).contiguous()
+    #             As_2d = As_2d.t().contiguous().t()  # [M, K//128] with stride(0)==1
 
-                # Bs: our input is [N//128, K//128], need [K//128, N//128] with stride(0)==1
-                # Transpose to get [K//128, N//128], then make K-major via t().contiguous().t()
-                Bs_km = Bs.contiguous().t()  # [K//128, N//128]
-                Bs_km = Bs_km.t().contiguous().t()  # Make K-major (stride(0)==1)
+    #             # Bs: our input is [N//128, K//128], need [K//128, N//128] with stride(0)==1
+    #             # Transpose to get [K//128, N//128], then make K-major via t().contiguous().t()
+    #             Bs_km = Bs.contiguous().t()  # [K//128, N//128]
+    #             Bs_km = Bs_km.t().contiguous().t()  # Make K-major (stride(0)==1)
 
-                # Call CUTLASS kernel - it returns the output tensor
-                # Signature: cutlass_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias=None) -> Tensor
-                C = kernel.cutlass_scaled_mm(A_2d, B_col_major, As_2d, Bs_km, output_dtype, None)
-                # Reshape output back
-                C_shape = original_shape[:-1] + (N,)
-                return C.view(C_shape)
-            except Exception as e:
-                logger.warning_once(f"CUTLASS kernel failed: {e}. Falling back to Triton.")
+    #             # Call CUTLASS kernel - it returns the output tensor
+    #             # Signature: cutlass_scaled_mm(a, b, scale_a, scale_b, out_dtype, bias=None) -> Tensor
+    #             C = kernel.cutlass_scaled_mm(A_2d, B_col_major, As_2d, Bs_km, output_dtype, None)
+    #             # Reshape output back
+    #             C_shape = original_shape[:-1] + (N,)
+    #             return C.view(C_shape)
+    #         except Exception as e:
+    #             logger.warning_once(f"CUTLASS kernel failed: {e}. Falling back to Triton.")
 
     # Fall back to Triton
     return w8a8_block_fp8_matmul_triton(A, B, As, Bs, block_size, output_dtype)
@@ -625,7 +625,7 @@ class FP8Expert(nn.Module):
         from ..activations import ACT2FN
 
         self.block_size = block_size
-        self.num_experts = config.num_local_experts if hasattr(config, "num_local_experts") else config.num_experts
+        self.num_experts = config.num_local_experts if hasattr(config, "num_local_experts") else config.num_experts // 8
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = (
             config.moe_intermediate_size if hasattr(config, "moe_intermediate_size") else config.intermediate_size
@@ -678,7 +678,7 @@ class FP8Expert(nn.Module):
 
         for expert_idx in expert_hit:
             expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
+            if expert_idx == self.num_experts // 8: # i have 3 processes for now
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]

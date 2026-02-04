@@ -724,6 +724,74 @@ class ColwiseParallel(TensorParallelLayer):
         shape[dim] = end - start
         return tuple(shape)
 
+class Gather(TensorParallelLayer):
+    """
+    Column-wise parallel: weight is sharded on dim -2 (output features).
+    Forward: input replicated -> output sharded on last dim.
+    If gather_output=True, output is all-gathered to produce full tensor.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @staticmethod
+    def _prepare_input_fn(mod, outputs, device_mesh):
+        """
+        Imagine if you had 4 tokens, top_k = 4, and 128experts.
+        With EP = 8. The num_local_expert should be 128/8 = 16
+        Imagine router_indices being:
+        [ 52,  42, 119,  67],
+        [102,  89,  61,  40],
+        [ 82, 103,   4,  34],
+        [ 93,  23, 109,  11],
+
+        then you can map which rank should be getting which values
+
+        [3, 2, 7, 4],
+        [6, 5, 3, 2],
+        [5, 6, 0, 2],
+        [5, 1, 6, 0],
+
+        Thus for say rank 0, you fill with 16 (num_local_expert) the index tensor
+
+        [ 16, 16, 16, 16],
+        [ 16, 16, 16, 16],
+        [ 16, 16, 4, 16],
+        [ 16, 16, 16, 11],
+
+        This works well. For another rank you need to make sure you round to num_local_expert
+        because the next operation will one hot encode the router index vector.
+
+        This allows us to know directly which local expert is hit.
+        Similarly the scores are indexed with something created form
+        topk_indices.
+
+        The kinda naive training loop that we use for device_map "auto" uses a similar logic.
+        Here we are just making each rank believe that he is alone, and he computes his part of the hiddenstates.
+        Mask invalid indices with num_local_expert for one-hot encoding, so the computes will skip the masking index.
+        """
+        ep_rank, ep_size = device_mesh.get_local_rank(), device_mesh.size()
+        if mod.num_experts % ep_size != 0:
+            raise ValueError(
+                f"The number of experts must be divisible by number of ep_size: {mod.num_experts} % {ep_size} != 0"
+            )
+        num_local_experts = mod.num_experts // ep_size
+        hidden_states, topk_indices, topk_weights = outputs
+        topk_weights = torch.zeros_like(hidden_states, dtype=topk_weights.dtype).scatter_(1, topk_indices, topk_weights)
+        topk_weights = topk_weights[:, ep_rank * num_local_experts : (ep_rank + 1) * num_local_experts]
+        topk_indices = topk_indices.masked_fill((topk_indices // num_local_experts) != ep_rank, -1)
+        # As -1 % 1 is 0, we can only use mask fill when num_local_experts is 1
+        if num_local_experts > 1:
+            topk_indices = torch.fmod(topk_indices, num_local_experts)
+        else:
+            topk_indices = topk_indices.masked_fill(topk_indices > 0, 0).masked_fill(topk_indices < 0, -1)
+        topk_indices = topk_indices.masked_fill(topk_indices == -1, num_local_experts)
+        return hidden_states, topk_indices, topk_weights
+
+    def _prepare_output_fn(self, mod, outputs, device_mesh):
+        return all_reduce_forward(outputs, device_mesh)
+
+
 
 class RowwiseParallel(TensorParallelLayer):
     """
@@ -936,9 +1004,15 @@ class GroupedGemmParallel(TensorParallelLayer):
                 f"Global number of experts must be divisible by number of devices: {global_num_experts} % {self.device_mesh.size()} != 0"
             )
         local_num_experts = global_num_experts // self.device_mesh.size()
-        return param[self.rank * local_num_experts : (self.rank + 1) * local_num_experts].to(
-            device=device, dtype=dtype
-        )
+        shard_size = local_num_experts
+        start = device.index * shard_size
+        end = (device.index+1) * shard_size
+        # special case we don't "shard" just send this entire tensor to the correct rank.
+        if start <= tensor_idx < end:
+            # this tensor does need to be materialized on this device:
+            return param[:].to(device=device)
+        else:
+            return []
 
     def get_expected_sharded_shape(self, full_shape: tuple[int, ...] | torch.Size) -> tuple[int, ...]:
         # GroupedGemm shards on dim 0 (experts dimension)
@@ -1078,6 +1152,7 @@ class ParallelInterface(GeneralInterface):
             "grouped_gemm": GroupedGemmParallel(),
             "ep_router": RouterParallel(),
             "moe_tp_experts": MoeTensorParalellExperts(),
+            "gather": Gather(),
         }
         if is_torch_available() and _torch_distributed_available
         else {}

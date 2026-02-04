@@ -185,7 +185,7 @@ class MergeModulelist(ConversionOps):
         merged: dict[str, torch.Tensor] = {}
         for source_pattern, tensors in input_dict.items():
             target_pattern = self.get_target_pattern(input_dict, source_pattern, target_patterns)
-            merged[target_pattern] = torch.stack(tensors, dim=self.dim)
+            merged[target_pattern] = torch.stack([k for k in tensors if k != []], dim=self.dim)
         return merged
 
     def get_target_pattern(self, input_dict: dict, source_pattern: str, target_patterns: list[str]) -> str:
@@ -716,7 +716,7 @@ class WeightConverter(WeightTransform):
         loading_info: LoadStateDictInfo | None = None,
     ):
         # Collect the tensors here - we use a new dictionary to avoid keeping them in memory in the internal
-        # attribute during the whole process
+        # attribute during the whole proces
         collected_tensors = self.materialize_tensors()
 
         for op in self.operations:
@@ -1150,7 +1150,7 @@ def convert_and_load_state_dict_in_model(
                         mapping.distributed_operation = tp_layer(
                             device_mesh=device_mesh, rank=device_mesh.get_local_rank(), empty_param=empty_param.clone()
                         )
-                    shard_index = len(mapping.collected_tensors.get(original_key, []))
+                    shard_index = len(mapping.collected_tensors.get(source_pattern, []))
                     future_or_tensor = spawn_tp_materialize(
                         thread_pool,
                         tensor,
