@@ -693,9 +693,11 @@ class AutoTokenizer:
             if tokenizer_class is None and not tokenizer_class_candidate.endswith("Fast"):
                 tokenizer_class = tokenizer_class_from_name(tokenizer_class_candidate + "Fast")
             if tokenizer_class is not None and tokenizer_class.__name__ == "PythonBackend":
+                raise ValueError("Fallback happened here!!")
                 tokenizer_class = TokenizersBackend
             # Fallback to TokenizersBackend if the class wasn't found
             if tokenizer_class is None:
+                raise ValueError("Fallback happened here!!")
                 tokenizer_class = TokenizersBackend
 
             return tokenizer_class.from_pretrained(pretrained_model_name_or_path, *inputs, **kwargs)
