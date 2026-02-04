@@ -49,58 +49,48 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Optimizer groups for cleaner dispatch
-_BITSANDBYTES_OPTIMIZERS = frozenset(
-    {
-        OptimizerNames.ADAMW_BNB,
-        OptimizerNames.ADAMW_8BIT,
-        OptimizerNames.PAGED_ADAMW,
-        OptimizerNames.PAGED_ADAMW_8BIT,
-        OptimizerNames.ADEMAMIX,
-        OptimizerNames.ADEMAMIX_8BIT,
-        OptimizerNames.PAGED_ADEMAMIX,
-        OptimizerNames.PAGED_ADEMAMIX_8BIT,
-        OptimizerNames.LION,
-        OptimizerNames.LION_8BIT,
-        OptimizerNames.PAGED_LION,
-        OptimizerNames.PAGED_LION_8BIT,
-        OptimizerNames.RMSPROP_BNB,
-        OptimizerNames.RMSPROP_8BIT,
-        OptimizerNames.RMSPROP_32BIT,
-    }
-)
+_BITSANDBYTES_OPTIMIZERS = {
+    OptimizerNames.ADAMW_BNB,
+    OptimizerNames.ADAMW_8BIT,
+    OptimizerNames.PAGED_ADAMW,
+    OptimizerNames.PAGED_ADAMW_8BIT,
+    OptimizerNames.ADEMAMIX,
+    OptimizerNames.ADEMAMIX_8BIT,
+    OptimizerNames.PAGED_ADEMAMIX,
+    OptimizerNames.PAGED_ADEMAMIX_8BIT,
+    OptimizerNames.LION,
+    OptimizerNames.LION_8BIT,
+    OptimizerNames.PAGED_LION,
+    OptimizerNames.PAGED_LION_8BIT,
+    OptimizerNames.RMSPROP_BNB,
+    OptimizerNames.RMSPROP_8BIT,
+    OptimizerNames.RMSPROP_32BIT,
+}
 
-_GALORE_OPTIMIZERS = frozenset(
-    {
-        OptimizerNames.GALORE_ADAMW,
-        OptimizerNames.GALORE_ADAMW_8BIT,
-        OptimizerNames.GALORE_ADAFACTOR,
-        OptimizerNames.GALORE_ADAMW_LAYERWISE,
-        OptimizerNames.GALORE_ADAMW_8BIT_LAYERWISE,
-        OptimizerNames.GALORE_ADAFACTOR_LAYERWISE,
-    }
-)
+_GALORE_OPTIMIZERS = {
+    OptimizerNames.GALORE_ADAMW,
+    OptimizerNames.GALORE_ADAMW_8BIT,
+    OptimizerNames.GALORE_ADAFACTOR,
+    OptimizerNames.GALORE_ADAMW_LAYERWISE,
+    OptimizerNames.GALORE_ADAMW_8BIT_LAYERWISE,
+    OptimizerNames.GALORE_ADAFACTOR_LAYERWISE,
+}
 
-_APOLLO_OPTIMIZERS = frozenset(
-    {
-        OptimizerNames.APOLLO_ADAMW,
-        OptimizerNames.APOLLO_ADAMW_LAYERWISE,
-    }
-)
+_APOLLO_OPTIMIZERS = {
+    OptimizerNames.APOLLO_ADAMW,
+    OptimizerNames.APOLLO_ADAMW_LAYERWISE,
+}
 
-_SCHEDULE_FREE_OPTIMIZERS = frozenset(
-    {
-        OptimizerNames.SCHEDULE_FREE_RADAM,
-        OptimizerNames.SCHEDULE_FREE_ADAMW,
-        OptimizerNames.SCHEDULE_FREE_SGD,
-    }
-)
+_SCHEDULE_FREE_OPTIMIZERS = {
+    OptimizerNames.SCHEDULE_FREE_RADAM,
+    OptimizerNames.SCHEDULE_FREE_ADAMW,
+    OptimizerNames.SCHEDULE_FREE_SGD,
+}
 
-_TORCHAO_OPTIMIZERS = frozenset(
-    {
-        OptimizerNames.ADAMW_TORCH_4BIT,
-        OptimizerNames.ADAMW_TORCH_8BIT,
-    }
-)
+_TORCHAO_OPTIMIZERS = {
+    OptimizerNames.ADAMW_TORCH_4BIT,
+    OptimizerNames.ADAMW_TORCH_8BIT,
+}
 
 
 def _parse_optim_args(optim_args_str: str | None) -> dict[str, str]:
