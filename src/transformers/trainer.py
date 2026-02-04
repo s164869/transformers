@@ -100,6 +100,7 @@ from .trainer_pt_utils import (
     get_model_param_count,
     get_module_class_from_name,
     get_parameter_names,
+    is_attention_mask_causal,
     nested_detach,
     nested_gather,
     reissue_pt_warnings,
@@ -3596,49 +3597,6 @@ class Trainer:
 
         return inputs
 
-    def _is_attention_mask_causal(self, attention_mask):
-        """
-        Check if an attention mask is causal (compatible with causal attention).
-        Context parallelism only supports causal attention patterns. This function
-        checks if the provided attention mask is compatible.
-
-        Args:
-            attention_mask (torch.Tensor): The attention mask to check
-
-        Returns:
-            bool: True if the mask is causal or compatible with causal attention
-        """
-        if attention_mask is None:
-            return True  # No mask is considered causal (model uses default causal masking)
-
-        # Handle different mask dimensions
-        if attention_mask.dim() == 2:
-            # (batch_size, seq_len) - standard padding mask, compatible with causal attention
-            return True
-        elif attention_mask.dim() in [3, 4]:
-            # (batch_size, seq_len, seq_len) or (batch_size, num_heads, seq_len, seq_len)
-            # Check if it's lower triangular (causal)
-            seq_len = attention_mask.shape[-1]
-            if seq_len <= 1:
-                return True  # Single token or empty is always causal
-
-            # Take first batch and head (if 4D) for checking pattern
-            if attention_mask.dim() == 4:
-                mask = attention_mask[0, 0]  # First batch, first head
-            else:
-                mask = attention_mask[0]  # First batch
-
-            # Check if upper triangular part is masked (should be 0 or very negative for causal)
-            upper_triangular = torch.triu(mask, diagonal=1)
-
-            # For causal masks, upper triangular should be 0 or very negative (like -inf)
-            # Use a reasonable threshold to handle float precision issues
-            is_causal = torch.all(upper_triangular <= 1e-6) or torch.all(upper_triangular < -1e4)
-            return is_causal.item() if isinstance(is_causal, torch.Tensor) else is_causal
-
-        # For unknown dimensions, be conservative and reject
-        return False
-
     def _prepare_context_parallel_inputs(self, model, inputs: dict[str, torch.Tensor | Any]):
         """
         Prepare inputs for context parallelism by setting up buffers and validation.
@@ -3700,7 +3658,7 @@ class Trainer:
                     # Accelerate applies hooks to replace mask with is_causal arg in SDPA
                     # Check if the mask is really causal and if not throw an error
                     attention_mask = inputs["attention_mask"]
-                    if not self._is_attention_mask_causal(attention_mask):
+                    if not is_attention_mask_causal(attention_mask):
                         raise ValueError(
                             "Context parallelism only supports causal attention masks. "
                             "The provided attention_mask is not causal. "
@@ -4945,45 +4903,6 @@ class Trainer:
             ignore_patterns=["_*", f"{PREFIX_CHECKPOINT_DIR}-*"],
             revision=revision,
         )
-
-    def _add_sm_patterns_to_gitignore(self) -> None:
-        """Add SageMaker Checkpointing patterns to .gitignore file."""
-        # Make sure we only do this on the main process
-        if not self.is_world_process_zero():
-            return
-
-        patterns = ["*.sagemaker-uploading", "*.sagemaker-uploaded"]
-
-        # Get current .gitignore content
-        if os.path.exists(os.path.join(self.repo.local_dir, ".gitignore")):
-            with open(os.path.join(self.repo.local_dir, ".gitignore")) as f:
-                current_content = f.read()
-        else:
-            current_content = ""
-
-        # Add the patterns to .gitignore
-        content = current_content
-        for pattern in patterns:
-            if pattern not in content:
-                if content.endswith("\n"):
-                    content += pattern
-                else:
-                    content += f"\n{pattern}"
-
-        # Write the .gitignore file if it has changed
-        if content != current_content:
-            with open(os.path.join(self.repo.local_dir, ".gitignore"), "w") as f:
-                logger.debug(f"Writing .gitignore file. Content: {content}")
-                f.write(content)
-
-        self.repo.git_add(".gitignore")
-
-        # avoid race condition with git status
-        time.sleep(0.5)
-
-        if not self.repo.is_repo_clean():
-            self.repo.git_commit("Add *.sagemaker patterns to .gitignore.")
-            self.repo.git_push()
 
     def create_accelerator_and_postprocess(self):
         # We explicitly don't rely on the `Accelerator` to do gradient accumulation
