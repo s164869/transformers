@@ -40,7 +40,7 @@ _torch_distributed_available = torch.distributed.is_available()
 
 if TYPE_CHECKING:
     from .integrations.tensor_parallel import TensorParallelLayer
-    from .modeling_utils import PreTrainedModel
+    from .modeling_utils import LoadStateDictConfig, PreTrainedModel
     from .quantizers import HfQuantizer
 
 
@@ -185,7 +185,7 @@ class MergeModulelist(ConversionOps):
         merged: dict[str, torch.Tensor] = {}
         for source_pattern, tensors in input_dict.items():
             target_pattern = self.get_target_pattern(input_dict, source_pattern, target_patterns)
-            merged[target_pattern] = torch.stack(tensors, dim=self.dim)
+            merged[target_pattern] = torch.stack([k for k in tensors if k != []], dim=self.dim)
         return merged
 
     def get_target_pattern(self, input_dict: dict, source_pattern: str, target_patterns: list[str]) -> str:
@@ -637,7 +637,7 @@ class WeightTransform:
             tensors = self.collected_tensors.pop(key)
             # Async loading
             if isinstance(tensors[0], Future):
-                tensors = [future.result() for future in tensors]
+                tensors = [future.result() for future in tensors if future.result() is not None]
             # Sync loading
             elif callable(tensors[0]):
                 tensors = [func() for func in tensors]
@@ -716,7 +716,7 @@ class WeightConverter(WeightTransform):
         loading_info: LoadStateDictInfo | None = None,
     ):
         # Collect the tensors here - we use a new dictionary to avoid keeping them in memory in the internal
-        # attribute during the whole process
+        # attribute during the whole proces
         collected_tensors = self.materialize_tensors()
 
         for op in self.operations:
@@ -846,15 +846,17 @@ def log_conversion_errors(
             return curr_op.__class__.__name__
 
         op_name = _format_op_name(op)
+        import traceback
+        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         if isinstance(extras, tuple) and len(extras) == 2:
             length, target_keys = extras
             descriptor = f"{op_name} " if op_name else ""
             loading_info.conversion_errors[first_target_key] = (
-                f"{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {length}"
+                f"{tb_str}{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {length}"
             )
         elif isinstance(extras, str):
             suffix = f" via {op_name}" if op_name else ""
-            loading_info.conversion_errors[first_target_key] = f"{e}\nError{suffix} when processing parameter {extras}"
+            loading_info.conversion_errors[first_target_key] = f"{tb_str}{e}\nError{suffix} when processing parameter {extras}"
         elif extras is None and op_name:
             loading_info.conversion_errors[first_target_key] = f"{op_name}: {e}"
         else:
@@ -967,9 +969,8 @@ def rename_source_key(
 def convert_and_load_state_dict_in_model(
     model: PreTrainedModel,
     state_dict: dict[str, Any],
-    load_config: Any,
+    load_config: LoadStateDictConfig,
     tp_plan: dict[str, str] | None,
-    dtype_plan: dict | None = None,
     disk_offload_index: dict | None = None,
 ):
     r"""
@@ -1066,7 +1067,7 @@ def convert_and_load_state_dict_in_model(
     device_mesh = load_config.device_mesh
     disk_offload_folder = load_config.disk_offload_folder
     offload_buffers = load_config.offload_buffers
-    dtype_plan = dtype_plan or {}
+    dtype_plan = load_config.dtype_plan or {}
     weight_mapping = load_config.weight_mapping or []
     meta_model_state_dict = model.state_dict()
     model_buffers = {k for k, _ in model.named_buffers()}
@@ -1151,7 +1152,7 @@ def convert_and_load_state_dict_in_model(
                         mapping.distributed_operation = tp_layer(
                             device_mesh=device_mesh, rank=device_mesh.get_local_rank(), empty_param=empty_param.clone()
                         )
-                    shard_index = len(mapping.collected_tensors.get(original_key, []))
+                    shard_index = len(mapping.collected_tensors.get(source_pattern, [])) if isinstance(mapping, WeightConverter) and isinstance(mapping.operations[0], MergeModulelist) else None
                     future_or_tensor = spawn_tp_materialize(
                         thread_pool,
                         tensor,

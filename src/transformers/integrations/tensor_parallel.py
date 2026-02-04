@@ -65,10 +65,6 @@ def initialize_tensor_parallelism(
 
                 backend_map = {"cuda": "nccl", "cpu": "gloo", "xpu": "xccl", "hpu": "hccl"}
                 backend = backend_map.get(device_type)
-                if device_type == "cpu" and int(os.environ.get("CCL_WORKER_COUNT", "0")):
-                    backend = "ccl"
-                if device_type == "xpu" and not is_torch_greater_or_equal("2.8", accept_dev=True):
-                    backend = "ccl"
 
                 torch.distributed.init_process_group(backend=backend, rank=rank, world_size=world_size)
                 current_device = getattr(torch, device_type)
@@ -728,6 +724,25 @@ class ColwiseParallel(TensorParallelLayer):
         shape[dim] = end - start
         return tuple(shape)
 
+class AllReduce(TensorParallelLayer):
+    """
+    Column-wise parallel: weight is sharded on dim -2 (output features).
+    Forward: input replicated -> output sharded on last dim.
+    If gather_output=True, output is all-gathered to produce full tensor.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @staticmethod
+    def _prepare_input_fn(mod, inputs, device_mesh):
+        mod.num_experts = 1+ (mod.num_experts // device_mesh.size())
+        return inputs
+
+    def _prepare_output_fn(self, mod, outputs, device_mesh):
+        return all_reduce_forward(outputs, device_mesh)
+
+
 
 class RowwiseParallel(TensorParallelLayer):
     """
@@ -931,6 +946,12 @@ class GroupedGemmParallel(TensorParallelLayer):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+
+    @staticmethod
+    def _prepare_input_fn(mod, inputs, device_mesh):
+        mod.num_experts = 1 + (mod.num_experts // device_mesh.size())
+        return inputs
+
     def shard_tensor(
         self, param: torch.Tensor, tensor_idx: int | None = None, device=None, dtype=None
     ) -> torch.Tensor:
@@ -940,9 +961,22 @@ class GroupedGemmParallel(TensorParallelLayer):
                 f"Global number of experts must be divisible by number of devices: {global_num_experts} % {self.device_mesh.size()} != 0"
             )
         local_num_experts = global_num_experts // self.device_mesh.size()
-        return param[self.rank * local_num_experts : (self.rank + 1) * local_num_experts].to(
-            device=device, dtype=dtype
-        )
+        shard_size = local_num_experts
+        if isinstance(device, torch.device):
+            device = device.index if device.index is not None else 0
+        start = device * shard_size
+        end = (device+1) * shard_size
+        # special case we don't "shard" just send this entire tensor to the correct rank.
+        shape = param.get_shape() if not isinstance(param, torch.Tensor) else param.shape
+        if tensor_idx is not None and start <= tensor_idx < end:
+            # this tensor does need to be materialized on this device:
+            return param[:].to(device=device)
+        elif tensor_idx is None: # a bias or a weight, but already merged
+            return param[start:end].to(device=device, dtype=dtype)
+        elif len(shape) >=1 and tensor_idx is not None:
+            return None
+        else: # bias case
+            return param[:].to(device=device, dtype=dtype)
 
     def get_expected_sharded_shape(self, full_shape: tuple[int, ...] | torch.Size) -> tuple[int, ...]:
         # GroupedGemm shards on dim 0 (experts dimension)
@@ -1082,6 +1116,7 @@ class ParallelInterface(GeneralInterface):
             "grouped_gemm": GroupedGemmParallel(),
             "ep_router": RouterParallel(),
             "moe_tp_experts": MoeTensorParalellExperts(),
+            "all_reduce": AllReduce(),
         }
         if is_torch_available() and _torch_distributed_available
         else {}
@@ -1277,7 +1312,7 @@ def shard_and_distribute_module(
             tp_layer.empty_param = empty_param
             tp_layer.device_mesh = device_mesh
             tp_layer.rank = rank
-            param = tp_layer.shard_tensor(param, tensor_idx=None, dtype=param_casting_dtype)
+            param = tp_layer.shard_tensor(param, tensor_idx=None, dtype=param_casting_dtype, device=rank)
             if is_contiguous:
                 param = param.contiguous()
         except NotImplementedError as e:

@@ -110,7 +110,7 @@ class SolarOpenConfig(Glm4MoeConfig):
         "layers.*.self_attn.o_proj": "rowwise",
         "layers.*.mlp.experts.gate_up_proj": "local_rowwise",
         "layers.*.mlp.experts.down_proj": "local_rowwise",
-        "layers.*.mlp.experts": "gather",
+        "layers.*.mlp.experts": "all_reduce",
     }
 
     def __init__(
