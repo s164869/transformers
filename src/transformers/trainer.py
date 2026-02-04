@@ -91,13 +91,12 @@ from .trainer_pt_utils import (
     LayerWiseDummyOptimizer,
     LengthGroupedSampler,
     distributed_broadcast_scalars,
-    distributed_concat,
     find_batch_size,
     get_model_param_count,
     get_module_class_from_name,
     get_parameter_names,
     nested_detach,
-    nested_xla_mesh_reduce,
+    nested_gather,
     reissue_pt_warnings,
     remove_dummy_checkpoint,
     set_rng_state_for_device,
@@ -200,7 +199,7 @@ else:
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp
 
-    from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
+    from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_nested_concat
 
 if is_peft_available():
     from peft import PeftMixedModel, PeftModel
@@ -374,7 +373,7 @@ class Trainer:
     """
 
     # Those are used as methods of the Trainer in examples.
-    from .trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
+    from .trainer_pt_utils import log_metrics, metrics_format, save_metrics, save_state
 
     def __init__(
         self,
@@ -1780,22 +1779,6 @@ class Trainer:
         except (NameError, AttributeError, TypeError):  # no dataset or length, estimate by length of dataloader
             return len(dataloader) * self.args.per_device_train_batch_size
 
-    @staticmethod
-    def num_tokens(train_dl: DataLoader, max_steps: int | None = None) -> int:
-        """
-        Helper to get number of tokens in a [`~torch.utils.data.DataLoader`] by enumerating dataloader.
-        """
-        train_tokens = 0
-        try:
-            for batch in train_dl:
-                tokens = batch["input_ids"].numel()
-                if max_steps is not None:
-                    return tokens * max_steps
-                train_tokens += tokens
-        except KeyError:
-            logger.warning("Cannot get num_tokens from dataloader")
-        return train_tokens
-
     def _hp_search_setup(self, trial: Union["optuna.Trial", dict[str, Any]]):
         """HP search setup code"""
         self._trial = trial
@@ -2991,7 +2974,7 @@ class Trainer:
             logs: dict[str, float] = {}
 
             # all_gather + mean() to get average loss over all processes
-            tr_loss_scalar = self._nested_gather(tr_loss).mean().item()
+            tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
 
             # reset tr_loss to zero
             tr_loss -= tr_loss
@@ -4584,23 +4567,6 @@ class Trainer:
 
         return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
 
-    def _nested_gather(self, tensors, name=None):
-        """
-        Gather value of `tensors` (tensor or list/tuple of nested tensors) and convert them to numpy before
-        concatenating them to `gathered`
-        """
-        if tensors is None:
-            return
-        if is_torch_xla_available():
-            if name is None:
-                name = "nested_gather"
-            tensors = nested_xla_mesh_reduce(tensors, name)
-        elif is_sagemaker_mp_enabled():
-            tensors = smp_gather(tensors)
-        elif self.args.parallel_mode == ParallelMode.DISTRIBUTED:
-            tensors = distributed_concat(tensors)
-        return tensors
-
     def prediction_step(
         self,
         model: nn.Module,
@@ -5312,3 +5278,31 @@ class Trainer:
             len_dataloader,
             max_steps,
         )
+
+    def _get_learning_rate(self):
+        """
+        Returns the current learning rate from the scheduler.
+
+        Handles DeepSpeed's dynamic loss scaling warmup period where `get_last_lr` may fail.
+        """
+        if self.is_deepspeed_enabled:
+            # with deepspeed's fp16 and dynamic loss scale enabled the optimizer/scheduler steps may
+            # not run for the first few dozen steps while loss scale is too large, and thus during
+            # that time `get_last_lr` will fail if called during that warm up stage, so work around it:
+            try:
+                last_lr = self.lr_scheduler.get_last_lr()[0]
+            except AssertionError as e:
+                if "need to call step" in str(e):
+                    logger.warning("tried to get lr value before scheduler/optimizer started stepping, returning lr=0")
+                    last_lr = 0
+                else:
+                    raise
+        else:
+            if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                last_lr = self.optimizer.param_groups[0]["lr"]
+            else:
+                last_lr = self.lr_scheduler.get_last_lr()[0]
+
+        if torch.is_tensor(last_lr):
+            last_lr = last_lr.item()
+        return last_lr

@@ -218,6 +218,25 @@ def distributed_concat(tensor: Any, num_total_examples: int | None = None) -> An
         raise AssertionError("Not currently using distributed training")
 
 
+def nested_gather(tensors, parallel_mode, name=None):
+    """
+    Gather value of `tensors` (tensor or list/tuple of nested tensors) across processes.
+    """
+    from .training_args import ParallelMode
+
+    if tensors is None:
+        return
+    if is_torch_xla_available():
+        if name is None:
+            name = "nested_gather"
+        tensors = nested_xla_mesh_reduce(tensors, name)
+    elif is_sagemaker_mp_enabled():
+        tensors = smp_gather(tensors)
+    elif parallel_mode == ParallelMode.DISTRIBUTED:
+        tensors = distributed_concat(tensors)
+    return tensors
+
+
 def distributed_broadcast_scalars(
     scalars: list[int | float],
     num_total_examples: int | None = None,
@@ -726,34 +745,6 @@ class IterableDatasetShard(IterableDataset):
             return (len(self.dataset) // (self.batch_size * self.num_processes)) * self.batch_size
         else:
             return math.ceil(len(self.dataset) / (self.batch_size * self.num_processes)) * self.batch_size
-
-
-# In order to keep `trainer.py` compact and easy to understand, place any secondary PT Trainer
-# helper methods here
-
-
-def _get_learning_rate(self):
-    if self.is_deepspeed_enabled:
-        # with deepspeed's fp16 and dynamic loss scale enabled the optimizer/scheduler steps may
-        # not run for the first few dozen steps while loss scale is too large, and thus during
-        # that time `get_last_lr` will fail if called during that warm up stage, so work around it:
-        try:
-            last_lr = self.lr_scheduler.get_last_lr()[0]
-        except AssertionError as e:
-            if "need to call step" in str(e):
-                logger.warning("tried to get lr value before scheduler/optimizer started stepping, returning lr=0")
-                last_lr = 0
-            else:
-                raise
-    else:
-        if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            last_lr = self.optimizer.param_groups[0]["lr"]
-        else:
-            last_lr = self.lr_scheduler.get_last_lr()[0]
-
-    if torch.is_tensor(last_lr):
-        last_lr = last_lr.item()
-    return last_lr
 
 
 def _secs2timedelta(secs):
