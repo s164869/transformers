@@ -1,4 +1,3 @@
-# Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +11,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tensor parallel tester mixin for model tests."""
+"""
+
+    Weight Loading Paths & Test Coverage
+    ====================================
+
+    There are two distinct loading paths through the dynamic weight loading system:
+
+    PATH A: Direct Load (Dense models like Llama, Mistral)
+    -------------------------------------------------------
+    Checkpoint format == Model format (no conversion needed)
+
+        Checkpoint File
+             │
+             ▼
+        from_pretrained(tp_plan="auto")
+             │
+             ▼
+        ┌─────────────────────────────┐
+        │  For each weight:           │
+        │  1. Match key (direct)      │
+        │  2. [no conversion needed]  │
+        │  3. Apply TP sharding       │
+        │  4. Set parameter           │
+        └─────────────────────────────┘
+             │
+             ▼
+        TP-Sharded Model
+
+    Tests: test_tp_forward_direct, test_tp_backward_direct, test_tp_generation_direct
+
+
+    PATH B: Conversion + Load (MoE models like Mixtral, Qwen2-MoE)
+    --------------------------------------------------------------
+    but EXCEPTION for GPT_OSS as weight by default 3D 
+
+    Checkpoint format != Model format (conversion mapping required)
+
+        Original Checkpoint (unfused experts)
+             │
+             ▼
+        from_pretrained(tp_plan="auto")
+             │
+             ▼
+        ┌─────────────────────────────┐
+        │  For each weight:           │
+        │  1. Match key pattern       │
+        │  2. Apply conversion ops    │  ← MergeModulelist + Concatenate
+        │  3. Apply TP sharding       │
+        │  4. Set parameter           │
+        └─────────────────────────────┘
+             │
+             ▼
+        TP-Sharded Model (fused experts)
+
+    Tests: test_tp_generation_with_conversion, test_tp_conversion_integration
+"""
 
 import os
 import tempfile
 from abc import ABC, abstractmethod
 
 from transformers import set_seed
+from transformers.conversion_mapping import _MODEL_TO_CONVERSION_PATTERN
 from transformers.testing_utils import (
     backend_device_count,
     get_torch_dist_unique_port,
@@ -32,6 +87,12 @@ if is_torch_available():
     import torch
     import torch.distributed as dist
     import torch.multiprocessing as mp
+
+
+def _debug_log(rank, msg):
+    """Print debug message only from rank 0."""
+    if rank == 0:
+        print(f"[TP Test Debug] {msg}")
 
 
 def get_packed_grad_shard(grad, world_size, rank, dim):
@@ -57,6 +118,78 @@ def get_packed_grad_shard(grad, world_size, rank, dim):
 
     # Select along the sharded dimension
     return grad.index_select(dim, torch.tensor(indices, device=grad.device))
+
+
+def _create_original_format_checkpoint(model, tmp_dir, model_type):
+    """Create a checkpoint in original (unfused) format to trigger conversion mapping.
+
+    This unfuses the internal gate_up_proj format back to the original checkpoint format
+    that the model was originally trained with (e.g., separate w1/w3/w2 for Mixtral,
+    or separate gate_proj/up_proj/down_proj for Qwen2Moe).
+    """
+    from safetensors.torch import save_file
+
+    # Determine conversion pattern
+    conversion_pattern = _MODEL_TO_CONVERSION_PATTERN.get(model_type)
+
+    state_dict = model.state_dict()
+    original_state_dict = {}
+
+    for key, tensor in state_dict.items():
+        if conversion_pattern == "mixtral":
+            # Mixtral-style: .mlp.experts.X → .block_sparse_moe.experts.N.wX
+            if ".mlp.experts.gate_up_proj" in key:
+                # Unfuse gate_up_proj: [num_experts, 2*intermediate, hidden]
+                num_experts = tensor.shape[0]
+                intermediate_dim = tensor.shape[1] // 2
+                gate, up = tensor.split(intermediate_dim, dim=1)
+
+                base_key = key.replace(".mlp.experts.gate_up_proj", ".block_sparse_moe")
+                for expert_idx in range(num_experts):
+                    original_state_dict[f"{base_key}.experts.{expert_idx}.w1.weight"] = gate[expert_idx]
+                    original_state_dict[f"{base_key}.experts.{expert_idx}.w3.weight"] = up[expert_idx]
+            elif ".mlp.experts.down_proj" in key:
+                # Unfuse down_proj: [num_experts, hidden, intermediate]
+                num_experts = tensor.shape[0]
+                base_key = key.replace(".mlp.experts.down_proj", ".block_sparse_moe")
+                for expert_idx in range(num_experts):
+                    original_state_dict[f"{base_key}.experts.{expert_idx}.w2.weight"] = tensor[expert_idx]
+            elif ".mlp.router" in key:
+                # Rename router: .mlp.router → .block_sparse_moe.gate
+                new_key = key.replace(".mlp.router", ".block_sparse_moe.gate")
+                original_state_dict[new_key] = tensor
+            else:
+                original_state_dict[key] = tensor
+
+        elif conversion_pattern == "qwen2_moe":
+            # Qwen2-style: .mlp.experts.X → .mlp.experts.N.X_proj
+            if ".mlp.experts.gate_up_proj" in key:
+                # Unfuse gate_up_proj: [num_experts, 2*intermediate, hidden]
+                num_experts = tensor.shape[0]
+                intermediate_dim = tensor.shape[1] // 2
+                gate, up = tensor.split(intermediate_dim, dim=1)
+
+                base_key = key.replace(".mlp.experts.gate_up_proj", ".mlp.experts")
+                for expert_idx in range(num_experts):
+                    original_state_dict[f"{base_key}.{expert_idx}.gate_proj.weight"] = gate[expert_idx]
+                    original_state_dict[f"{base_key}.{expert_idx}.up_proj.weight"] = up[expert_idx]
+            elif ".mlp.experts.down_proj" in key:
+                # Unfuse down_proj: [num_experts, hidden, intermediate]
+                num_experts = tensor.shape[0]
+                base_key = key.replace(".mlp.experts.down_proj", ".mlp.experts")
+                for expert_idx in range(num_experts):
+                    original_state_dict[f"{base_key}.{expert_idx}.down_proj.weight"] = tensor[expert_idx]
+            else:
+                original_state_dict[key] = tensor
+        else:
+            # No conversion pattern - keep as-is
+            original_state_dict[key] = tensor
+
+    # Save checkpoint in safetensors format
+    save_file(original_state_dict, os.path.join(tmp_dir, "model.safetensors"))
+
+    # Save config
+    model.config.save_pretrained(tmp_dir)
 
 
 def _global_wrapper(rank, func, tp, port, func_args, func_kwargs):
@@ -127,6 +260,52 @@ class TensorParallelTesterMixin(ABC):
         config = self.model_tester.get_config()
         return hasattr(config, "base_model_tp_plan") and config.base_model_tp_plan is not None
 
+    def _load_tp_and_reference_models(self, model_path, model_class):
+        """Load TP model and non-TP reference model for comparison.
+
+        Returns:
+            tuple: (model_tp, model_ref, device)
+        """
+        model_tp = model_class.from_pretrained(model_path, tp_plan="auto")
+        dist.barrier()
+
+        device = model_tp.device
+        model_ref = model_class.from_pretrained(model_path)
+        model_ref = model_ref.to(device)
+
+        return model_tp, model_ref, device
+
+    def _verify_tp_sharding(self, rank, model_tp, model_ref):
+        """Verify TP sharding by comparing parameter shapes between TP and reference models.
+
+        Returns:
+            list: Names of sharded parameters
+        """
+        world_size = dist.get_world_size()
+        sharded_params = []
+
+        for (name, param), (_, param_full) in zip(model_tp.named_parameters(), model_ref.named_parameters()):
+            if param.shape != param_full.shape:
+                sharded_params.append(name)
+                _debug_log(rank, f"TP sharded: {name} - full: {param_full.shape} -> sharded: {param.shape}")
+
+                # Verify sharding is correct
+                for dim in range(param.ndim):
+                    if param.size(dim) != param_full.size(dim):
+                        if "gate_up_proj" in name:
+                            expected_size = param_full.size(dim) // world_size
+                            assert param.size(dim) == expected_size, (
+                                f"Packed weight {name} sharding incorrect: expected {expected_size}, got {param.size(dim)}"
+                            )
+                        else:
+                            expected_size = (param_full.size(dim) + world_size - 1) // world_size
+                            assert param.size(dim) <= expected_size, (
+                                f"Weight {name} sharding incorrect: expected <= {expected_size}, got {param.size(dim)}"
+                            )
+                        break
+
+        return sharded_params
+
     def _get_tp_model_class(self):
         """Get the model class to use for TP tests (prefers *ForCausalLM)."""
         # Prefer model classes with a head (for computing loss)
@@ -159,29 +338,16 @@ class TensorParallelTesterMixin(ABC):
         """Implementation for comparing TP and non-TP model outputs."""
         set_seed(0)
 
-        # Load TP model first to determine device
-        model_tp = model_class.from_pretrained(model_path, tp_plan="auto")
-        dist.barrier()
+        model_tp, model, device = self._load_tp_and_reference_models(model_path, model_class)
         model_tp.eval()
-
-        # Load non-TP model and move to same device as TP model
-        device = model_tp.device
-        model = model_class.from_pretrained(model_path)
-        model = model.to(device)
         model.eval()
 
-        # Create deterministic inputs
-        batch_size, seq_length = 2, 64
-        vocab_size = model.config.vocab_size
         set_seed(42)
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_length)).to(device)
+        input_ids = torch.randint(0, model.config.vocab_size, (2, 64)).to(device)
 
         with torch.no_grad():
-            outputs = model(input_ids)
-            logits = outputs.logits
-
-            outputs_tp = model_tp(input_ids)
-            logits_tp = outputs_tp.logits
+            logits = model(input_ids).logits
+            logits_tp = model_tp(input_ids).logits
 
         diff = (logits - logits_tp).abs()
         assert torch.allclose(logits, logits_tp, atol=atol, rtol=rtol), (
@@ -195,32 +361,21 @@ class TensorParallelTesterMixin(ABC):
         """Implementation for comparing TP and non-TP model backward passes."""
         set_seed(0)
 
-        # Load TP model first to determine device
-        model_tp = model_class.from_pretrained(model_path, tp_plan="auto")
-        dist.barrier()
+        model_tp, model, device = self._load_tp_and_reference_models(model_path, model_class)
         model_tp.train()
-
-        # Load non-TP model and move to same device as TP model
-        device = model_tp.device
-        model = model_class.from_pretrained(model_path)
-        model = model.to(device)
         model.train()
 
-        # Create deterministic inputs
-        batch_size, seq_length = 2, 64
         vocab_size = model.config.vocab_size
         set_seed(42)
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_length)).to(device)
-        labels = torch.randint(0, vocab_size, (batch_size, seq_length)).to(device)
+        input_ids = torch.randint(0, vocab_size, (2, 64)).to(device)
+        set_seed(43)
+        labels = torch.randint(0, vocab_size, (2, 64)).to(device)
 
-        # Forward and backward for non-TP model
-        outputs = model(input_ids, labels=labels)
-        loss = outputs.loss
+        # Forward and backward for both models
+        loss = model(input_ids, labels=labels).loss
         loss.backward()
 
-        # Forward and backward for TP model
-        outputs_tp = model_tp(input_ids, labels=labels)
-        loss_tp = outputs_tp.loss
+        loss_tp = model_tp(input_ids, labels=labels).loss
         loss_tp.backward()
 
         # Compare losses
@@ -241,11 +396,9 @@ class TensorParallelTesterMixin(ABC):
                 if grad.shape != grad_tp.shape:
                     for dim in range(grad.ndim):
                         if grad.size(dim) != grad_tp.size(dim):
-                            # Packed weights (gate_up_proj) use interleaved sharding
                             if "gate_up_proj" in name:
                                 grad = get_packed_grad_shard(grad, world_size, rank, dim)
                             else:
-                                # Regular weights use simple chunking
                                 shard_size = grad_tp.size(dim)
                                 start = rank * shard_size
                                 grad = grad.narrow(dim, start, shard_size)
@@ -259,27 +412,15 @@ class TensorParallelTesterMixin(ABC):
         dist.barrier()
 
     def _test_tp_generation_impl(self, _rank, model_path, model_class, atol, rtol, max_new_tokens):
-        """Implementation for comparing TP and non-TP model generation outputs."""
+        """Implementation for comparing TP and non-TP model generation outputs (direct load path)."""
         set_seed(0)
 
-        # Load TP model first to determine device
-        model_tp = model_class.from_pretrained(model_path, tp_plan="auto")
-        dist.barrier()
+        model_tp, model, device = self._load_tp_and_reference_models(model_path, model_class)
         model_tp.eval()
-
-        # Load non-TP model and move to same device as TP model
-        device = model_tp.device
-        model = model_class.from_pretrained(model_path)
-        model = model.to(device)
         model.eval()
 
-        # Create deterministic inputs (short prompt for generation)
-        batch_size, seq_length = 1, 10
-        vocab_size = model.config.vocab_size
         set_seed(42)
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_length)).to(device)
-
-        # Generation kwargs for greedy decoding with logit output
+        input_ids = torch.randint(0, model.config.vocab_size, (1, 10)).to(device)
         generation_kwargs = {
             "max_new_tokens": max_new_tokens,
             "do_sample": False,
@@ -290,39 +431,115 @@ class TensorParallelTesterMixin(ABC):
         }
 
         with torch.no_grad():
-            # Generate with non-TP model
             output = model.generate(input_ids, **generation_kwargs)
-
-            # Generate with TP model
             output_tp = model_tp.generate(input_ids, **generation_kwargs)
 
-        # Compare generated sequences
-        sequences_match = torch.equal(output.sequences, output_tp.sequences)
-
         # Compare logits/scores at each generation step
-        scores = torch.stack(output.scores)  # (max_new_tokens, batch, vocab)
+        scores = torch.stack(output.scores)
         scores_tp = torch.stack(output_tp.scores)
 
         diff = (scores - scores_tp).abs()
-        logits_match = torch.allclose(scores, scores_tp, atol=atol, rtol=rtol)
-
-        assert logits_match, (
-            f"TP and non-TP model generation logits differ. "
+        assert torch.allclose(scores, scores_tp, atol=atol, rtol=rtol), (
+            f"TP and non-TP model generation logits differ (direct load path). "
             f"Max diff: {diff.max().item()} | Mean diff: {diff.mean().item()}"
         )
 
-        # If logits match but sequences don't, that's unexpected
-        if not sequences_match and logits_match:
-            # This shouldn't happen with greedy decoding if logits match
-            pass  # Log warning but don't fail since logits match
+        _debug_log(_rank, "Generation with direct load path PASSED")
+        dist.barrier()
 
+    def _test_tp_generation_with_conversion_impl(self, _rank, model_path, model_class, atol, rtol, max_new_tokens):
+        """Implementation for testing TP generation with conversion mapping."""
+        set_seed(0)
+
+        model_tp, model, device = self._load_tp_and_reference_models(model_path, model_class)
+        model_tp.eval()
+        model.eval()
+
+        # Verify conversion mapping was applied
+        assert hasattr(model_tp, "_weight_conversions"), "Conversion mapping was not applied during load"
+        assert model_tp._weight_conversions is not None, "Conversion mapping is None"
+        _debug_log(_rank, f"Conversion mapping applied: {len(model_tp._weight_conversions)} conversions")
+
+        # Verify TP sharding by comparing parameter shapes
+        self._verify_tp_sharding(_rank, model_tp, model)
+
+        # Test generation
+        set_seed(42)
+        input_ids = torch.randint(0, model.config.vocab_size, (1, 10)).to(device)
+        generation_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "num_beams": 1,
+            "output_scores": True,
+            "return_dict_in_generate": True,
+            "use_cache": True,
+        }
+
+        with torch.no_grad():
+            output = model.generate(input_ids, **generation_kwargs)
+            output_tp = model_tp.generate(input_ids, **generation_kwargs)
+
+        scores = torch.stack(output.scores)
+        scores_tp = torch.stack(output_tp.scores)
+
+        diff = (scores - scores_tp).abs()
+        assert torch.allclose(scores, scores_tp, atol=atol, rtol=rtol), (
+            f"TP and non-TP model generation logits differ (with conversion mapping). "
+            f"Max diff: {diff.max().item()} | Mean diff: {diff.mean().item()}"
+        )
+
+        _debug_log(_rank, "Generation with conversion mapping PASSED")
+        dist.barrier()
+
+    def _test_tp_conversion_integration_impl(self, rank, model_path, model_class):
+        """Verify that conversion mapping + TP sharding both execute during load."""
+        model_tp, model, device = self._load_tp_and_reference_models(model_path, model_class)
+
+        # Verification 1: Conversion mapping was applied
+        assert hasattr(model_tp, "_weight_conversions"), "Conversion mapping not applied"
+        assert model_tp._weight_conversions is not None, "Conversion mapping is None"
+
+        from transformers.core_model_loading import WeightConverter
+
+        converters = [c for c in model_tp._weight_conversions if isinstance(c, WeightConverter)]
+        assert len(converters) > 0, "No WeightConverter operations were applied"
+        _debug_log(rank, f"Applied {len(converters)} WeightConverter operations")
+        if rank == 0:
+            for c in converters:
+                print(f"  - {c.source_patterns} -> {c.target_patterns}")
+
+        # Verification 2: TP sharding occurred
+        sharded_params = self._verify_tp_sharding(rank, model_tp, model)
+        assert len(sharded_params) > 0, "No parameters were sharded by TP"
+        _debug_log(rank, f"{len(sharded_params)} parameters sharded:")
+        if rank == 0:
+            for name in sharded_params[:5]:
+                print(f"  - {name}")
+
+        # Verification 3: Forward pass works
+        set_seed(42)
+        input_ids = torch.randint(0, model_tp.config.vocab_size, (2, 32)).to(device)
+
+        with torch.no_grad():
+            output_tp = model_tp(input_ids)
+            output_full = model(input_ids)
+
+        assert torch.allclose(output_tp.logits, output_full.logits, atol=1e-4, rtol=1e-4), (
+            "TP and non-TP outputs differ after conversion+sharding"
+        )
+
+        _debug_log(rank, "Forward pass verification PASSED")
         dist.barrier()
 
     # ============================================================
-    # Public test methods
+    # Public test methods - PATH A: Direct Load (Dense models)
     # ============================================================
-    def test_tensor_parallel_forward(self):
-        """Test that TP and non-TP models produce the same outputs."""
+    def test_tp_forward_direct(self):
+        """Test TP forward pass with direct load path (no conversion mapping).
+
+        Loading path: checkpoint → TP sharding → model
+        Applies to: Dense models (Llama, Mistral, etc.) where checkpoint format == model format
+        """
         self._skip_if_not_supported()
 
         config = self.model_tester.get_config()
@@ -340,8 +557,12 @@ class TensorParallelTesterMixin(ABC):
                 tmp_dir, model_class, atol, rtol
             )
 
-    def test_tensor_parallel_backward(self):
-        """Test that TP and non-TP models produce the same gradients."""
+    def test_tp_backward_direct(self):
+        """Test TP backward pass with direct load path (no conversion mapping).
+
+        Loading path: checkpoint → TP sharding → model
+        Applies to: Dense models (Llama, Mistral, etc.) where checkpoint format == model format
+        """
         self._skip_if_not_supported()
 
         config = self.model_tester.get_config()
@@ -359,22 +580,87 @@ class TensorParallelTesterMixin(ABC):
                 tmp_dir, model_class, atol, rtol
             )
 
-    def test_tensor_parallel_generation(self):
-        """Test that TP and non-TP models produce the same generation logits."""
+    def test_tp_generation_direct(self):
+        """Test TP generation with direct load path (no conversion mapping).
+
+        Loading path: checkpoint → TP sharding → model → generate
+        Applies to: Dense models (Llama, Mistral, etc.) where checkpoint format == model format
+        """
         self._skip_if_not_supported()
 
         config = self.model_tester.get_config()
         model_class = self._get_tp_model_class()
         atol = self.tensor_parallel_atol
         rtol = self.tensor_parallel_rtol
-        max_new_tokens = 10  # Keep short for test speed
+        max_new_tokens = 10
 
-        # Save model to temp directory so we can load it with from_pretrained
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # Create and save a model with the test config
             model = model_class(config)
             model.save_pretrained(tmp_dir)
 
             _init_distributed(tp=self.tensor_parallel_size)(self._test_tp_generation_impl)(
                 tmp_dir, model_class, atol, rtol, max_new_tokens
+            )
+
+    # ============================================================
+    # Public test methods - PATH B: Conversion + Load (MoE models)
+    # ============================================================
+    def test_tp_generation_with_conversion(self):
+        """Test TP generation with conversion mapping path (MoE weight fusion).
+
+        Loading path: original checkpoint → conversion mapping → TP sharding → model → generate
+        Applies to: MoE models (Mixtral, Qwen2-MoE, etc.) where checkpoint has unfused experts
+
+        This test creates a checkpoint in the original format (e.g., separate expert weights
+        like w1/w3/w2 for Mixtral) and verifies that loading with tp_plan="auto" correctly
+        applies the conversion mapping to fuse weights during tensor parallel loading.
+        """
+        self._skip_if_not_supported()
+
+        # Only run for models with conversion mapping
+        config = self.model_tester.get_config()
+        model_type = getattr(config, "model_type", None)
+        if model_type not in _MODEL_TO_CONVERSION_PATTERN:
+            self.skipTest(f"Model type {model_type} has no conversion mapping defined")
+
+        model_class = self._get_tp_model_class()
+        atol = self.tensor_parallel_atol
+        rtol = self.tensor_parallel_rtol
+        max_new_tokens = 10
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Create model and save in original (unfused) format
+            model = model_class(config)
+            _create_original_format_checkpoint(model, tmp_dir, model_type)
+
+            _init_distributed(tp=self.tensor_parallel_size)(self._test_tp_generation_with_conversion_impl)(
+                tmp_dir, model_class, atol, rtol, max_new_tokens
+            )
+
+    def test_tp_conversion_integration(self):
+        """Test that conversion mapping + TP sharding integrate correctly during load.
+
+        Loading path: original checkpoint → conversion mapping → TP sharding → model
+        Applies to: MoE models (Mixtral, Qwen2-MoE, etc.) where checkpoint has unfused experts
+
+        This test verifies that:
+        1. WeightConverter operations are applied (conversion mapping)
+        2. Parameters are sharded correctly (TP sharding)
+        3. Forward pass produces correct outputs
+        """
+        self._skip_if_not_supported()
+
+        config = self.model_tester.get_config()
+        model_type = getattr(config, "model_type", None)
+        if model_type not in _MODEL_TO_CONVERSION_PATTERN:
+            self.skipTest(f"Model type {model_type} has no conversion mapping")
+
+        model_class = self._get_tp_model_class()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model = model_class(config)
+            _create_original_format_checkpoint(model, tmp_dir, model_type)
+
+            _init_distributed(tp=self.tensor_parallel_size)(self._test_tp_conversion_integration_impl)(
+                tmp_dir, model_class
             )
