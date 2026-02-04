@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from ..utils import is_torch_available, strtobool
 from ..utils.quantization_config import QuantizationMethod
 
+
 if TYPE_CHECKING:
     from torch import nn
 
@@ -52,6 +53,7 @@ def is_fsdp_enabled():
         )
 
     return False
+
 
 def get_fsdp_ckpt_kwargs():
     """

@@ -68,8 +68,8 @@ from .integrations.deepspeed import (
     is_deepspeed_available,
     propagate_args_to_deepspeed,
 )
-from .integrations.peft import MIN_PEFT_VERSION
 from .integrations.fsdp import get_fsdp_ckpt_kwargs, update_fsdp_plugin_peft
+from .integrations.peft import MIN_PEFT_VERSION
 from .integrations.tpu import tpu_spmd_dataloader
 from .modelcard import TrainingSummary
 from .modeling_utils import PreTrainedModel, unwrap_model
