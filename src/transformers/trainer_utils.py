@@ -49,8 +49,12 @@ from .utils import (
     is_torch_npu_available,
     is_torch_xla_available,
     is_torch_xpu_available,
+    logging,
     requires_backends,
 )
+
+
+logger = logging.get_logger(__name__)
 
 
 if is_torch_available():
@@ -262,7 +266,7 @@ def sort_checkpoints(
     if use_mtime and len(checkpoints_sorted) > 1:
         mtime_diff = checkpoints_sorted[-1][0] - checkpoints_sorted[0][0]
         if mtime_diff < 1.0:
-            warnings.warn("mtime may not be reliable on this filesystem, falling back to numerical ordering")
+            logger.warning("mtime may not be reliable on this filesystem, falling back to numerical ordering")
             return sort_checkpoints(
                 output_dir, checkpoint_prefix, use_mtime=False, best_model_checkpoint=best_model_checkpoint
             )
