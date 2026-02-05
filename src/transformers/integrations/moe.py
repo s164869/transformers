@@ -113,7 +113,7 @@ def batched_mm_experts_forward(
     # Reshape for easier indexing
     # S is the number of selected tokens-experts pairs (S = num_tokens * num_top_k)
     token_idx = torch.arange(num_tokens, device=device).unsqueeze(1).expand(-1, num_top_k).reshape(-1)  # (S,)
-    if top_k_weights.sum() == 0:
+    if top_k_weights.sum() == torch.tensor(0.0, device=top_k_weights.device):
         # If all routing weights are zero local experts are not selected
         return torch.zeros_like(hidden_states)
 
@@ -148,7 +148,8 @@ def batched_mm_experts_forward(
     )  # (S, hidden_dim)
 
     # Apply routing weights and zero out invalid expert contributions
-    sample_weights = sample_weights[top_k_index.clamp(0, self.num_experts - 1).reshape(-1)]  # Clamp for safe indexing
+    if sample_weights.shape != expert_ids_clamped.shape:
+        sample_weights = sample_weights.gather(0, expert_ids_clamped)
     out_per_sample = out_per_sample * sample_weights.unsqueeze(-1)  # (S, hidden_dim)
     out_per_sample = out_per_sample * valid_mask.unsqueeze(-1).to(out_per_sample.dtype)
 
@@ -274,11 +275,8 @@ def grouped_mm_experts_forward(
 
     # Restore original order
     if num_invalid > 0:
-        # Create full output tensor initialized to zeros for invalid tokens
-        out_per_sample = torch.zeros(expert_ids.shape[0], hidden_dim, device=device, dtype=out_per_sample_g.dtype)
-        # Map processed outputs back to valid positions using the sorted indices
-        valid_sorted_positions = perm[:-num_invalid]
-        out_per_sample[valid_sorted_positions] = out_per_sample_g
+        out_per_sample = out_per_sample_g[inv_perm.clamp(max=out_per_sample_g.shape[0] - 1)]  # (S, hidden_dim)
+        out_per_sample = out_per_sample * (inv_perm < out_per_sample_g.shape[0]).unsqueeze(-1).to(out_per_sample.dtype)  # Zero out invalid samples
     else:
         out_per_sample = out_per_sample_g[inv_perm]  # (S, hidden_dim)
 
