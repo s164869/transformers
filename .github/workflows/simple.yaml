@@ -518,7 +518,7 @@ jobs:
             BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
             
             # Build URL with parameters
-            DELETE_URL="http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/delete/?tunnel_url=${FULL_HOSTNAME}"
+            DELETE_URL="http://129.212.196.173/ai-management-service/api/v1/cloudflare-tunnel-info/delete/?tunnel_url=https://${FULL_HOSTNAME}"
             
             # Add browser_profile_id if it exists
             if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
