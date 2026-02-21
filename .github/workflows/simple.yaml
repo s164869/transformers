@@ -15,7 +15,7 @@ env:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 30
     
     steps:
       - name: Checkout
@@ -138,6 +138,16 @@ jobs:
             xubuntu-wallpapers \
             gnome-icon-theme
 
+      - name: Install Google Chrome
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Installing Google Chrome..."
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+          rm google-chrome-stable_current_amd64.deb
+          google-chrome --version
+          echo "✅ Google Chrome installed"
+
       - name: Install TurboVNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
@@ -210,6 +220,475 @@ jobs:
             echo "❌ noVNC failed to start"
             exit 1
           fi
+
+      - name: Download and Setup BotXByte Extension
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Downloading BotXByte extension..."
+
+          # Install python3-venv
+          sudo apt-get install -y python3 python3-venv
+
+          DOWNLOADS_DIR="$HOME/Downloads"
+          EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
+          mkdir -p "$DOWNLOADS_DIR"
+
+          # Download the extension zip
+          wget -q -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
+            "https://github.com/user-attachments/files/25434674/real-botxbyte-extension.zip"
+
+          # Extract to a temp location to handle nested directories
+          TEMP_EXTRACT="/tmp/extension-extract"
+          rm -rf "$TEMP_EXTRACT"
+          mkdir -p "$TEMP_EXTRACT"
+          unzip -o "$DOWNLOADS_DIR/real-botxbyte-extension.zip" -d "$TEMP_EXTRACT"
+          rm "$DOWNLOADS_DIR/real-botxbyte-extension.zip"
+
+          # Find where manifest.json actually is
+          MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
+          if [ -z "$MANIFEST_PATH" ]; then
+            echo "❌ manifest.json not found in extracted zip!"
+            find "$TEMP_EXTRACT" -type f
+            exit 1
+          fi
+
+          ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
+          echo "Found manifest.json at: $MANIFEST_PATH"
+
+          # Move to the expected location
+          rm -rf "$EXTENSION_DIR"
+          mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
+          rm -rf "$TEMP_EXTRACT"
+
+          # Clean up stale/non-extension files
+          rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
+          rm -rf "$EXTENSION_DIR/.git" 2>/dev/null || true
+          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/.env.dev" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
+
+          echo "Extension contents:"
+          ls -la "$EXTENSION_DIR/"
+          echo "manifest.json:"
+          cat "$EXTENSION_DIR/manifest.json"
+
+          # Set up Python virtual environment and install requirements
+          cd "$EXTENSION_DIR"
+          python3 -m venv venv
+          source venv/bin/activate
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            echo "✅ Requirements installed in venv"
+          else
+            echo "⚠️ No requirements.txt found"
+          fi
+
+          echo "✅ BotXByte Extension setup complete"
+          echo "  Extension path: $EXTENSION_DIR"
+
+      - name: Start BotXByte Server
+        if: steps.config.outputs.vnc_enabled == 'true'
+        id: botxbyte_server
+        run: |
+          echo "Starting BotXByte server (server.py)..."
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+          cd "$EXTENSION_DIR"
+
+          source venv/bin/activate
+          export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          nohup python3 server.py > /tmp/botxbyte-server.log 2>&1 &
+          SERVER_PID=$!
+          echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+
+          sleep 3
+
+          if kill -0 $SERVER_PID 2>/dev/null; then
+            echo "✅ BotXByte server started (PID: $SERVER_PID)"
+            echo "  WebSocket: ws://localhost:8765"
+            echo "  HTTP API:  http://localhost:8766"
+          else
+            echo "❌ BotXByte server failed to start"
+            cat /tmp/botxbyte-server.log
+            exit 1
+          fi
+
+      - name: Launch Chrome with BotXByte Extension
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Launching Chrome with BotXByte extension on VNC desktop..."
+
+          export DISPLAY=:1
+          export NO_AT_BRIDGE=1
+          export DBUS_SESSION_BUS_ADDRESS=/dev/null
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+          CHROME_PROFILE_DIR="$HOME/chrome-botxbyte-profile"
+
+          # Create clean profile
+          rm -rf "$CHROME_PROFILE_DIR"
+          mkdir -p "$CHROME_PROFILE_DIR"
+
+          # ================================================================
+          # Symlink default Chrome profile to our custom one so every
+          # Chrome launch (command line, taskbar, XFCE) uses the same profile
+          # ================================================================
+          pkill -9 -f "chrome" 2>/dev/null || true
+          sleep 2
+          rm -rf "$HOME/.config/google-chrome"
+          ln -sfn "$CHROME_PROFILE_DIR" "$HOME/.config/google-chrome"
+          echo "  Symlinked ~/.config/google-chrome -> $CHROME_PROFILE_DIR"
+
+          # Verify extension directory
+          if [ ! -f "$EXTENSION_DIR/manifest.json" ]; then
+            echo "❌ Extension manifest.json not found"
+            exit 1
+          fi
+          rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
+
+          echo "Extension manifest:"
+          python3 -c "import json; m=json.load(open('$EXTENSION_DIR/manifest.json')); print(f\"  Name: {m.get('name','?')}\"); print(f\"  Version: {m.get('version','?')}\"); print(f\"  Manifest V{m.get('manifest_version','?')}\")"
+
+          # Chrome policy to allow developer mode extensions
+          sudo mkdir -p /etc/opt/chrome/policies/managed
+          echo '{
+            "ExtensionSettings": { "*": { "installation_mode": "allowed" } },
+            "DeveloperToolsAvailability": 1,
+            "ExtensionDeveloperModeAllowed": true,
+            "BlockExternalExtensions": false
+          }' | sudo tee /etc/opt/chrome/policies/managed/allow_dev_extensions.json > /dev/null
+
+          pip install websocket-client -q
+
+          # ================================================================
+          # PHASE 1: Launch Chrome WITHOUT extension, open chrome://extensions
+          # ================================================================
+          echo "Phase 1: Opening Chrome..."
+          touch "$CHROME_PROFILE_DIR/First Run"
+
+          google-chrome \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-gpu \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --enable-extensions \
+            --user-data-dir="$CHROME_PROFILE_DIR" \
+            --remote-debugging-port=9222 \
+            --remote-allow-origins=* \
+            --new-window \
+            "chrome://extensions" \
+            2>/tmp/chrome-stderr.log &
+
+          CHROME_PID=$!
+          echo "  Chrome PID: $CHROME_PID"
+          sleep 10
+
+          if ! pgrep -f "chrome" > /dev/null; then
+            echo "❌ Chrome failed to launch"
+            tail -20 /tmp/chrome-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+          echo "  ✅ Chrome is running"
+
+          # ================================================================
+          # PHASE 2: Enable developer mode via CDP (Chrome DevTools Protocol)
+          # Must go through Chrome's own UI so Secure Preferences HMAC
+          # is computed correctly - the ONLY reliable way
+          # ================================================================
+          echo "Phase 2: Enabling developer mode..."
+
+          python3 << 'PYEOF'
+          import websocket
+          import json
+          import time
+          import urllib.request
+
+          def cdp_http(path):
+              try:
+                  resp = urllib.request.urlopen(f"http://localhost:9222{path}", timeout=10)
+                  return json.loads(resp.read())
+              except Exception as e:
+                  print(f"  CDP HTTP error: {e}")
+                  return None
+
+          def cdp_send(ws, method, params=None, msg_id=1):
+              msg = {"id": msg_id, "method": method}
+              if params:
+                  msg["params"] = params
+              ws.send(json.dumps(msg))
+              while True:
+                  resp = json.loads(ws.recv())
+                  if resp.get("id") == msg_id:
+                      return resp
+
+          # Find the chrome://extensions tab
+          targets = cdp_http("/json/list") or []
+          print(f"  Available targets: {len(targets)}")
+          for t in targets:
+              print(f"    [{t.get('type','?')}] {t.get('url','?')}")
+
+          ext_tab = None
+          for t in targets:
+              if "chrome://extensions" in t.get("url", ""):
+                  ext_tab = t
+                  break
+
+          if not ext_tab:
+              print("  chrome://extensions tab not found, navigating existing tab...")
+              page_tab = None
+              for t in targets:
+                  if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
+                      page_tab = t
+                      break
+              if not page_tab:
+                  print("  ❌ No page target found")
+                  exit(1)
+              nav_ws = websocket.create_connection(page_tab["webSocketDebuggerUrl"], timeout=15)
+              nav_ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": "chrome://extensions"}}))
+              while True:
+                  r = json.loads(nav_ws.recv())
+                  if r.get("id") == 1:
+                      break
+              nav_ws.close()
+              time.sleep(5)
+              targets = cdp_http("/json/list") or []
+              for t in targets:
+                  if "chrome://extensions" in t.get("url", ""):
+                      ext_tab = t
+                      break
+              if not ext_tab:
+                  print("  ❌ Failed to navigate to chrome://extensions")
+                  exit(1)
+
+          ws_url = ext_tab.get("webSocketDebuggerUrl")
+          if not ws_url:
+              print("  ❌ No WebSocket URL for extensions tab")
+              exit(1)
+
+          print(f"  Connected to: {ext_tab.get('url')}")
+          ws = websocket.create_connection(ws_url, timeout=15)
+          time.sleep(2)
+
+          # Toggle developer mode via shadow DOM
+          toggle_js = """
+          (async function() {
+              for (let i = 0; i < 20; i++) {
+                  const manager = document.querySelector('extensions-manager');
+                  if (manager && manager.shadowRoot) {
+                      const toolbar = manager.shadowRoot.querySelector('extensions-toolbar');
+                      if (toolbar && toolbar.shadowRoot) {
+                          const toggle = toolbar.shadowRoot.querySelector('#devMode');
+                          if (toggle) {
+                              if (!toggle.checked) {
+                                  toggle.click();
+                                  await new Promise(r => setTimeout(r, 1000));
+                                  return 'ENABLED';
+                              }
+                              return 'ALREADY_ENABLED';
+                          }
+                      }
+                  }
+                  await new Promise(r => setTimeout(r, 500));
+              }
+              return 'TIMEOUT';
+          })()
+          """
+
+          result = cdp_send(ws, "Runtime.evaluate", {"expression": toggle_js, "awaitPromise": True})
+          status = result.get("result", {}).get("result", {}).get("value", "unknown")
+          print(f"  Developer mode: {status}")
+
+          if status == "TIMEOUT":
+              print("  ❌ Could not find developer mode toggle")
+              ws.close()
+              exit(1)
+
+          time.sleep(2)
+
+          # Verify toggle is ON
+          verify_js = """
+          (function() {
+              const manager = document.querySelector('extensions-manager');
+              if (!manager || !manager.shadowRoot) return 'no manager';
+              const toolbar = manager.shadowRoot.querySelector('extensions-toolbar');
+              if (!toolbar || !toolbar.shadowRoot) return 'no toolbar';
+              const toggle = toolbar.shadowRoot.querySelector('#devMode');
+              if (!toggle) return 'no toggle';
+              return toggle.checked ? 'ON' : 'OFF';
+          })()
+          """
+          verify = cdp_send(ws, "Runtime.evaluate", {"expression": verify_js}, msg_id=2)
+          dev_state = verify.get("result", {}).get("result", {}).get("value", "unknown")
+          print(f"  Developer mode toggle: {dev_state}")
+          ws.close()
+
+          if dev_state == "ON":
+              print("  ✅ Developer mode is ON")
+          else:
+              print(f"  ⚠️ Developer mode: {dev_state}")
+          PYEOF
+
+          # ================================================================
+          # PHASE 3: Kill Chrome, relaunch WITH the extension loaded
+          # (Load Unpacked via --load-extension flag)
+          # ================================================================
+          echo "Phase 3: Restarting Chrome with extension (Load Unpacked)..."
+
+          sleep 3
+          pkill -15 -f "chrome" 2>/dev/null || true
+          pkill -15 -f "google-chrome" 2>/dev/null || true
+          sleep 3
+          pkill -9 -f "chrome" 2>/dev/null || true
+          pkill -9 -f "google-chrome" 2>/dev/null || true
+          sleep 2
+
+          rm -f "$CHROME_PROFILE_DIR/SingletonLock"
+          rm -f "$CHROME_PROFILE_DIR/SingletonCookie"
+          rm -f "$CHROME_PROFILE_DIR/SingletonSocket"
+
+          python3 -c "
+          import json, os
+          pf = os.path.expanduser('~/chrome-botxbyte-profile/Default/Preferences')
+          if os.path.exists(pf):
+              with open(pf) as f: p = json.load(f)
+              p.setdefault('profile', {})['exited_cleanly'] = True
+              p.setdefault('profile', {})['exit_type'] = 'Normal'
+              with open(pf, 'w') as f: json.dump(p, f, indent=2)
+              print('  Clean exit set in Preferences')
+          "
+
+          google-chrome \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-gpu \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --enable-extensions \
+            --load-extension="$EXTENSION_DIR" \
+            --user-data-dir="$CHROME_PROFILE_DIR" \
+            --remote-debugging-port=9222 \
+            --remote-allow-origins=* \
+            --enable-logging \
+            --v=1 \
+            --new-window \
+            "chrome://extensions" \
+            > /tmp/chrome-launch.log 2>&1 &
+
+          CHROME_PID=$!
+          echo "  Chrome PID: $CHROME_PID"
+          sleep 12
+
+          if ! pgrep -f "chrome" > /dev/null; then
+            echo "❌ Chrome failed to relaunch"
+            tail -30 /tmp/chrome-launch.log
+            exit 1
+          fi
+
+          grep -i "extension" /tmp/chrome-launch.log | head -10 || true
+
+          # ================================================================
+          # PHASE 4: Verify extension is loaded and active
+          # ================================================================
+          echo "Phase 4: Verifying extension..."
+
+          python3 << 'PYEOF'
+          import websocket
+          import json
+          import time
+          import urllib.request
+
+          def cdp_http(path):
+              try:
+                  resp = urllib.request.urlopen(f"http://localhost:9222{path}", timeout=10)
+                  return json.loads(resp.read())
+              except:
+                  return None
+
+          def cdp_send(ws, method, params=None, msg_id=1):
+              msg = {"id": msg_id, "method": method}
+              if params:
+                  msg["params"] = params
+              ws.send(json.dumps(msg))
+              while True:
+                  resp = json.loads(ws.recv())
+                  if resp.get("id") == msg_id:
+                      return resp
+
+          # Check for service worker (extension background)
+          targets = cdp_http("/json/list") or []
+          print(f"  Chrome targets: {len(targets)}")
+          sw_found = False
+          for t in targets:
+              ttype = t.get("type", "?")
+              url = t.get("url", "?")
+              title = t.get("title", "?")
+              if ttype == "service_worker" or "extension" in url.lower():
+                  print(f"    [{ttype}] {title} - {url}")
+              if ttype == "service_worker" and "nmmhkkegccagdldgiimedpiccmgmieda" not in url:
+                  sw_found = True
+                  print(f"  ✅ BotXByte service worker RUNNING: {url}")
+
+          if not sw_found:
+              print("  ⚠️ BotXByte service worker not found")
+
+          # Check extensions visible on chrome://extensions page
+          ext_tab = None
+          for t in targets:
+              if "chrome://extensions" in t.get("url", ""):
+                  ext_tab = t
+                  break
+
+          if ext_tab and ext_tab.get("webSocketDebuggerUrl"):
+              ws = websocket.create_connection(ext_tab["webSocketDebuggerUrl"], timeout=15)
+              time.sleep(2)
+
+              check_js = """
+              (function() {
+                  const manager = document.querySelector('extensions-manager');
+                  if (!manager || !manager.shadowRoot) return JSON.stringify({error: 'no manager'});
+                  const toolbar = manager.shadowRoot.querySelector('extensions-toolbar');
+                  const devMode = toolbar?.shadowRoot?.querySelector('#devMode')?.checked || false;
+                  const items = manager.shadowRoot.querySelectorAll('extensions-item');
+                  const exts = [];
+                  items.forEach(item => {
+                      const sr = item.shadowRoot;
+                      const name = sr?.querySelector('#name')?.textContent?.trim() || 'unknown';
+                      const id = item.id || 'unknown';
+                      exts.push({name: name, id: id});
+                  });
+                  return JSON.stringify({devMode: devMode, extensions: exts});
+              })()
+              """
+
+              result = cdp_send(ws, "Runtime.evaluate", {"expression": check_js})
+              val = result.get("result", {}).get("result", {}).get("value", "{}")
+
+              try:
+                  data = json.loads(val)
+                  print(f"  Developer mode: {'ON' if data.get('devMode') else 'OFF'}")
+                  exts = data.get("extensions", [])
+                  print(f"  Visible extensions: {len(exts)}")
+                  for e in exts:
+                      print(f"    - {e.get('name')} (ID: {e.get('id')})")
+              except:
+                  print(f"  Raw: {val}")
+
+              ws.close()
+
+          version = cdp_http("/json/version") or {}
+          print(f"  Chrome: {version.get('Browser', '?')}")
+          PYEOF
+
+          # Check server.py is still running
+          if pgrep -f "server.py" > /dev/null; then
+            echo "✅ BotXByte server is running"
+          else
+            echo "⚠️ BotXByte server is NOT running"
+            cat /tmp/botxbyte-server.log 2>/dev/null || true
+          fi
+
+          echo "✅ Chrome launch with extension complete"
 
       - name: Install cloudflared
         if: steps.config.outputs.cloudflare_enabled == 'true'
@@ -386,6 +865,10 @@ jobs:
           echo "🌐 Access URL: https://${{ steps.config.outputs.hostname }}/vnc.html"
           echo "🔑 Password: (configured)"
           echo ""
+          echo "🔌 BotXByte Extension: Loaded in Chrome (auto-connected to server.py)"
+          echo "   WebSocket: ws://localhost:8765"
+          echo "   HTTP API:  http://localhost:8766"
+          echo ""
           
       - name: Run Moti on Desktop
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -427,23 +910,24 @@ jobs:
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
-          
+          export DBUS_SESSION_BUS_ADDRESS=/dev/null
+
           echo "Keeping VNC session alive..."
-          
+
           # Monitor for 30 mins (1800 seconds)
           END_TIME=$((SECONDS + 1800))
-          
+
           while [ $SECONDS -lt $END_TIME ]; do
             REMAINING=$((END_TIME - SECONDS))
             HOURS=$((REMAINING / 3600))
             MINUTES=$(((REMAINING % 3600) / 60))
-            
+
             if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
               echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | Access: https://${{ steps.config.outputs.hostname }}/vnc.html"
             else
               echo "⏱️ Remaining: ${HOURS}h ${MINUTES}m | VNC running locally"
             fi
-            
+
             # Check and restart VNC if needed
             if ! pgrep -f "Xvnc.*:1" > /dev/null; then
               echo "❌ VNC stopped! Restarting..."
@@ -455,7 +939,7 @@ jobs:
               fi
               echo "✅ VNC restarted successfully"
             fi
-            
+
             # Check and restart tunnel if Cloudflare is enabled
             if [ "${{ steps.config.outputs.cloudflare_enabled }}" = "true" ]; then
               if ! pgrep -x "cloudflared" > /dev/null; then
@@ -470,11 +954,71 @@ jobs:
                 echo "✅ Tunnel restarted successfully"
               fi
             fi
-            
+
+            # Check and restart BotXByte server if needed
+            if ! pgrep -f "server.py" > /dev/null; then
+              echo "❌ BotXByte server stopped! Restarting..."
+              EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+              cd "$EXTENSION_DIR"
+              source venv/bin/activate
+              export WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+              nohup python3 server.py > /tmp/botxbyte-server.log 2>&1 &
+              sleep 3
+              if pgrep -f "server.py" > /dev/null; then
+                echo "✅ BotXByte server restarted"
+              else
+                echo "⚠️ BotXByte server failed to restart"
+                cat /tmp/botxbyte-server.log
+              fi
+            fi
+
+            # Check and restart Chrome if needed
+            if ! pgrep -f "google-chrome" > /dev/null; then
+              echo "❌ Chrome stopped! Restarting..."
+              export DISPLAY=:1
+              export NO_AT_BRIDGE=1
+              EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+              CHROME_PROFILE_DIR="$HOME/chrome-botxbyte-profile"
+              google-chrome \
+                --no-first-run \
+                --no-default-browser-check \
+                --disable-gpu \
+                --no-sandbox \
+                --disable-dev-shm-usage \
+                --enable-extensions \
+                --load-extension="$EXTENSION_DIR" \
+                --user-data-dir="$CHROME_PROFILE_DIR" \
+                --remote-debugging-port=9222 \
+                --remote-allow-origins=* \
+                --new-window \
+                "chrome://extensions" \
+                2>/tmp/chrome-stderr.log &
+              sleep 5
+              if pgrep -f "google-chrome" > /dev/null; then
+                echo "✅ Chrome restarted with BotXByte extension"
+              else
+                echo "⚠️ Chrome failed to restart"
+              fi
+            fi
+
             sleep 30
           done
-          
+
           echo "✅ Session time expired"
+
+      - name: Cleanup BotXByte Server and Chrome
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Cleaning up BotXByte server and Chrome..."
+
+          # Kill Chrome
+          pkill -f "google-chrome" || true
+
+          # Kill server.py
+          pkill -f "server.py" || true
+
+          sleep 2
+          echo "✅ BotXByte cleanup complete"
 
       - name: Cleanup Webshare IP Authorization
         if: always() && steps.config.outputs.webshare_enabled == 'true'
