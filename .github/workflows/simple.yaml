@@ -100,9 +100,9 @@ jobs:
             echo "✅ Webshare Config Loaded"
           fi
 
-          # Parse optional workflow_id for auto-task dispatch
-          WORKFLOW_ID=$(echo "$CONFIG" | jq -r '.workflow_id // ""')
-          echo "workflow_id=$WORKFLOW_ID" >> $GITHUB_OUTPUT
+          # Parse optional workflow_ids for auto-task dispatch (JSON array)
+          WORKFLOW_IDS=$(echo "$CONFIG" | jq -c '.workflow_ids // []')
+          echo "workflow_ids=$WORKFLOW_IDS" >> $GITHUB_OUTPUT
 
           echo "✅ Config Loaded:"
           echo "  VNC: $VNC_ENABLED"
@@ -201,6 +201,38 @@ jobs:
           google-chrome --version
           echo "✅ Google Chrome installed"
 
+      - name: Install and Start Docker
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Setting up Docker..."
+
+          # Docker is pre-installed on ubuntu-latest, just ensure the service is running
+          if command -v docker &> /dev/null; then
+            echo "Docker already installed: $(docker --version)"
+          else
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
+
+          # Ensure Docker service is running
+          sudo systemctl start docker 2>/dev/null || sudo dockerd &
+          sleep 3
+
+          # Add current user to docker group so commands work without sudo
+          sudo usermod -aG docker $USER
+
+          # Install docker compose plugin if not present
+          if ! docker compose version &> /dev/null; then
+            echo "Installing Docker Compose plugin..."
+            sudo apt-get update -q
+            sudo apt-get install -y docker-compose-plugin
+          fi
+
+          # Verify
+          docker --version
+          docker compose version
+          echo "✅ Docker is ready"
+
       - name: Install TurboVNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
@@ -288,7 +320,7 @@ jobs:
 
           # Download the extension zip
           wget -q -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
-            "https://github.com/user-attachments/files/25621113/real-botxbyte-extension.zip"
+            "https://github.com/user-attachments/files/25812191/real-botxbyte-extension.zip"
 
           # Extract to a temp location to handle nested directories
           TEMP_EXTRACT="/tmp/extension-extract"
@@ -577,13 +609,7 @@ jobs:
                 \"ingress\": [
                   {
                     \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"path\": \"/vnc/*\",
-                    \"service\": \"http://localhost:${NOVNC_PORT}\",
-                    \"originRequest\": {}
-                  },
-                  {
-                    \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"path\": \"/browser-agent-management-service/*\",
+                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|\\\\d+).*\",
                     \"service\": \"http://localhost:8766\",
                     \"originRequest\": {}
                   },
@@ -696,7 +722,7 @@ jobs:
           WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
           BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
           CLOUDFLARE_TUNNEL_CREDENTIAL_ID="${{ steps.config.outputs.cloudflare_tunnel_credential_id }}"
-          WORKFLOW_ID="${{ steps.config.outputs.workflow_id }}"
+          WORKFLOW_IDS='${{ steps.config.outputs.workflow_ids }}'
 
           # Build base JSON body
           BODY="{
@@ -710,9 +736,9 @@ jobs:
             BODY="${BODY}, \"cloudflare_tunnel_credential_id\": \"${CLOUDFLARE_TUNNEL_CREDENTIAL_ID}\""
           fi
 
-          # Append optional workflow_id for auto-task dispatch
-          if [ -n "$WORKFLOW_ID" ] && [ "$WORKFLOW_ID" != "null" ]; then
-            BODY="${BODY}, \"workflow_id\": \"${WORKFLOW_ID}\""
+          # Append optional workflow_ids for auto-task dispatch (JSON array)
+          if [ -n "$WORKFLOW_IDS" ] && [ "$WORKFLOW_IDS" != "null" ] && [ "$WORKFLOW_IDS" != "[]" ]; then
+            BODY="${BODY}, \"workflow_ids\": ${WORKFLOW_IDS}"
           fi
 
           BODY="${BODY} }"
@@ -828,9 +854,6 @@ jobs:
               google-chrome \
                 --no-first-run \
                 --no-default-browser-check \
-                --disable-gpu \
-                --no-sandbox \
-                --disable-dev-shm-usage \
                 --user-data-dir="$PROFILE_DIR" \
                 2>/tmp/chrome-stderr.log &
               sleep 5
