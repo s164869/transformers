@@ -535,6 +535,53 @@ jobs:
             exit 1
           fi
 
+      - name: Check Developer Mode and Update DB
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Checking Chrome developer_mode status..."
+
+          PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          # Search for "developer_mode":true in the browser profile preferences
+          IS_CHROME_EXTENSION="false"
+          if grep -rq '"developer_mode":true' "$PROFILE_DIR/" 2>/dev/null; then
+            IS_CHROME_EXTENSION="true"
+            echo "✅ developer_mode is TRUE → setting is_chrome_extension=true"
+          else
+            echo "ℹ️ developer_mode is not true (or not found) → is_chrome_extension=false"
+          fi
+
+          echo "is_chrome_extension: $IS_CHROME_EXTENSION"
+
+          # Log the grep results for debugging
+          echo "--- Developer mode grep results ---"
+          grep -ro '"developer_mode":[^,}]*' "$PROFILE_DIR/" 2>/dev/null || echo "  No developer_mode entries found"
+          echo "---"
+
+          # Update is_chrome_extension in the database via PATCH API
+          if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
+            RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "http://129.212.196.173/ai-management-service/api/v1/browser-profile/${BROWSER_PROFILE_ID}" \
+              -X PATCH \
+              -H "Content-Type: application/json" \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}" \
+              -d "{\"is_chrome_extension\": ${IS_CHROME_EXTENSION}}")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ Browser profile updated: is_chrome_extension=$IS_CHROME_EXTENSION"
+            else
+              echo "⚠️ Failed to update is_chrome_extension (non-fatal)"
+              echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+            fi
+          else
+            echo "⚠️ No browser_profile_id, skipping is_chrome_extension DB update"
+          fi
+
       - name: Install cloudflared
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
