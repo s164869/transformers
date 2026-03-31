@@ -15,7 +15,7 @@ env:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 380
     
     steps:
       - name: Checkout
@@ -92,17 +92,48 @@ jobs:
             echo "✅ Wasabi Config Loaded (Bucket: $WASABI_BUCKET)"
           fi
 
+          # Parse proxy configuration from browser profile
+          PROXY_HOST=$(echo "$CONFIG" | jq -r '.proxy.host // ""')
+          PROXY_PORT=$(echo "$CONFIG" | jq -r '.proxy.port // ""')
+          PROXY_TYPE=$(echo "$CONFIG" | jq -r '.proxy.type // "http"')
+          echo "proxy_host=$PROXY_HOST" >> $GITHUB_OUTPUT
+          echo "proxy_port=$PROXY_PORT" >> $GITHUB_OUTPUT
+          echo "proxy_type=$PROXY_TYPE" >> $GITHUB_OUTPUT
+
+          if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ]; then
+            echo "✅ Proxy Config Loaded (${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT})"
+          fi
+
           # Parse Webshare-related values if Webshare is enabled
           if [ "$WEBSHARE_ENABLED" = "true" ]; then
             WEBSHARE_API_TOKEN=$(echo "$CONFIG" | jq -r '.webshare_api_token // ""')
             echo "webshare_api_token=$WEBSHARE_API_TOKEN" >> $GITHUB_OUTPUT
-            
+
             echo "✅ Webshare Config Loaded"
+          fi
+
+          # Parse Tailscale config
+          TAILSCALE_API_KEY=$(echo "$CONFIG" | jq -r '.tailscale_api_key // ""')
+          TAILSCALE_TOKEN=$(echo "$CONFIG" | jq -r '.tailscale_token // ""')
+          echo "tailscale_api_key=$TAILSCALE_API_KEY" >> $GITHUB_OUTPUT
+          echo "tailscale_token=$TAILSCALE_TOKEN" >> $GITHUB_OUTPUT
+
+          if [ -n "$TAILSCALE_API_KEY" ] && [ "$TAILSCALE_API_KEY" != "" ]; then
+            echo "✅ Tailscale Config Loaded"
           fi
 
           # Parse optional workflow_ids for auto-task dispatch (JSON array)
           WORKFLOW_IDS=$(echo "$CONFIG" | jq -c '.workflow_ids // []')
           echo "workflow_ids=$WORKFLOW_IDS" >> $GITHUB_OUTPUT
+
+          # Parse profile timeout (minutes), default 45 min, max 360 min (6 hours)
+          PROFILE_TIMEOUT_MINUTES=$(echo "$CONFIG" | jq -r '.profile_timeout_minutes // "45"')
+          # Clamp to valid range
+          if [ "$PROFILE_TIMEOUT_MINUTES" -lt 45 ] 2>/dev/null; then PROFILE_TIMEOUT_MINUTES=45; fi
+          if [ "$PROFILE_TIMEOUT_MINUTES" -gt 360 ] 2>/dev/null; then PROFILE_TIMEOUT_MINUTES=360; fi
+          PROFILE_TIMEOUT_SECONDS=$((PROFILE_TIMEOUT_MINUTES * 60))
+          echo "profile_timeout_minutes=$PROFILE_TIMEOUT_MINUTES" >> $GITHUB_OUTPUT
+          echo "profile_timeout_seconds=$PROFILE_TIMEOUT_SECONDS" >> $GITHUB_OUTPUT
 
           echo "✅ Config Loaded:"
           echo "  VNC: $VNC_ENABLED"
@@ -110,6 +141,7 @@ jobs:
           echo "  Webshare: $WEBSHARE_ENABLED"
           echo "  User ID: $USER_ID"
           echo "  Workspace ID: $WORKSPACE_ID"
+          echo "  Profile Timeout: ${PROFILE_TIMEOUT_MINUTES} min"
       
       - name: Register IP with Webshare
         if: steps.config.outputs.webshare_enabled == 'true'
@@ -137,7 +169,7 @@ jobs:
 
           # Register IP with Webshare
           RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
-            "https://proxy.webshare.io/api/v2/proxy/ipauthorization/" \
+            "https://proxy.webshare.io/api/v2/proxy/ipauthorization/?plan_id=12984667" \
             -X POST \
             -d "{\"ip_address\": \"$PUBLIC_IP\"}" \
             -H "Content-Type: application/json" \
@@ -153,6 +185,7 @@ jobs:
             echo "⚠️ Failed to register IP with Webshare"
             echo "$RESPONSE" | jq '.'
           fi
+
       
       - name: Install Desktop Environment
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -189,7 +222,8 @@ jobs:
             x11-utils \
             x11-xserver-utils \
             xfonts-base \
-            ffmpeg
+            ffmpeg \
+            wmctrl
 
       - name: Install Google Chrome
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -232,6 +266,19 @@ jobs:
           docker --version
           docker compose version
           echo "✅ Docker is ready"
+
+      - name: Install and Start Tailscale
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          echo "Starting Tailscale..."
+          sudo tailscale up --auth-key=${{ steps.config.outputs.tailscale_api_key }}
+
+          echo "Tailscale status:"
+          tailscale status
+          echo "✅ Tailscale is up"
 
       - name: Install TurboVNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -319,8 +366,8 @@ jobs:
           mkdir -p "$DOWNLOADS_DIR"
 
           # Download the extension zip
-          wget -q -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
-            "https://github.com/user-attachments/files/25812191/real-botxbyte-extension.zip"
+          wget -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
+            "https://raw.githubusercontent.com/sanket-sakariya/test-abc/main/real-botxbyte-extension.zip"
 
           # Extract to a temp location to handle nested directories
           TEMP_EXTRACT="/tmp/extension-extract"
@@ -348,7 +395,7 @@ jobs:
           # Clean up stale/non-extension files
           rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
           rm -rf "$EXTENSION_DIR/.git" 2>/dev/null || true
-          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/.env.dev" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
+          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
 
           echo "Extension contents:"
           ls -la "$EXTENSION_DIR/"
@@ -370,49 +417,6 @@ jobs:
           echo "✅ BotXByte Extension setup complete"
           echo "  Extension path: $EXTENSION_DIR"
 
-      - name: Download and Setup CF AutoClick Extension
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Downloading CF AutoClick extension..."
-
-          DOWNLOADS_DIR="$HOME/Downloads"
-          EXTENSION_DIR="$DOWNLOADS_DIR/cf-autoclick-extension"
-          mkdir -p "$DOWNLOADS_DIR"
-
-          # Download the extension zip
-          wget -q -O "$DOWNLOADS_DIR/cf-autoclick-master.zip" \
-            "https://github.com/user-attachments/files/25514727/cf-autoclick-master.zip"
-
-          # Extract to a temp location to handle nested directories
-          TEMP_EXTRACT="/tmp/cf-autoclick-extract"
-          rm -rf "$TEMP_EXTRACT"
-          mkdir -p "$TEMP_EXTRACT"
-          unzip -o "$DOWNLOADS_DIR/cf-autoclick-master.zip" -d "$TEMP_EXTRACT"
-          rm "$DOWNLOADS_DIR/cf-autoclick-master.zip"
-
-          # Find where manifest.json actually is
-          MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "❌ manifest.json not found in extracted zip!"
-            find "$TEMP_EXTRACT" -type f
-            exit 1
-          fi
-
-          ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
-          echo "Found manifest.json at: $MANIFEST_PATH"
-
-          # Move to the expected location
-          rm -rf "$EXTENSION_DIR"
-          mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
-          rm -rf "$TEMP_EXTRACT"
-
-          echo "Extension contents:"
-          ls -la "$EXTENSION_DIR/"
-          echo "manifest.json:"
-          cat "$EXTENSION_DIR/manifest.json"
-
-          echo "✅ CF AutoClick Extension setup complete"
-          echo "  Extension path: $EXTENSION_DIR"
 
       - name: Start BotXByte Server
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -514,13 +518,21 @@ jobs:
           export NO_AT_BRIDGE=1
           export DBUS_SESSION_BUS_ADDRESS=/dev/null
 
+          # Build proxy flag if proxy is configured
+          PROXY_HOST="${{ steps.config.outputs.proxy_host }}"
+          PROXY_PORT="${{ steps.config.outputs.proxy_port }}"
+          PROXY_TYPE="${{ steps.config.outputs.proxy_type }}"
+
+          CHROME_PROXY_FLAG=""
+          if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ] && [ -n "$PROXY_PORT" ] && [ "$PROXY_PORT" != "" ]; then
+            CHROME_PROXY_FLAG="--proxy-server=${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT}"
+            echo "Using proxy: $CHROME_PROXY_FLAG"
+          fi
+
           google-chrome \
             --no-first-run \
-            --no-default-browser-check \
-            --disable-gpu \
-            --no-sandbox \
-            --disable-dev-shm-usage \
             --user-data-dir="$PROFILE_DIR" \
+            $CHROME_PROXY_FLAG \
             2>/tmp/chrome-stderr.log &
 
           CHROME_PID=$!
@@ -534,6 +546,29 @@ jobs:
             tail -20 /tmp/chrome-stderr.log 2>/dev/null || true
             exit 1
           fi
+
+      - name: Load or Reload Extension via PyAutoGUI
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          export DISPLAY=:1
+
+          EXTENSION_DIR="$HOME/Downloads/real-botxbyte-extension"
+          PROFILE_EXISTS="${{ steps.browser_profile.outputs.profile_exists }}"
+
+          echo "profile_exists=$PROFILE_EXISTS"
+
+          cd "$EXTENSION_DIR"
+          source venv/bin/activate
+
+          if [ "$PROFILE_EXISTS" = "true" ]; then
+            echo "🔄 Profile existed in Wasabi → running refresh.py (reload extension)"
+            python3 refresh.py
+          else
+            echo "📦 Profile NOT in Wasabi → running opener.py (load extension first time)"
+            python3 opener.py
+          fi
+
+          echo "✅ Extension loader script finished"
 
       - name: Check Developer Mode and Update DB
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -835,8 +870,11 @@ jobs:
 
           echo "Keeping VNC session alive..."
 
-          # Monitor for 45 mins (2700 seconds)
-          END_TIME=$((SECONDS + 2700))
+          # Monitor for configured timeout (default 45 min)
+          TIMEOUT_SECONDS=${{ steps.config.outputs.profile_timeout_seconds }}
+          TIMEOUT_MINUTES=${{ steps.config.outputs.profile_timeout_minutes }}
+          echo "⏱️ Profile timeout: ${TIMEOUT_MINUTES} minutes (${TIMEOUT_SECONDS} seconds)"
+          END_TIME=$((SECONDS + TIMEOUT_SECONDS))
 
           while [ $SECONDS -lt $END_TIME ]; do
             REMAINING=$((END_TIME - SECONDS))
@@ -898,10 +936,18 @@ jobs:
               export DISPLAY=:1
               export NO_AT_BRIDGE=1
               PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+              PROXY_HOST="${{ steps.config.outputs.proxy_host }}"
+              PROXY_PORT="${{ steps.config.outputs.proxy_port }}"
+              PROXY_TYPE="${{ steps.config.outputs.proxy_type }}"
+              CHROME_PROXY_FLAG=""
+              if [ -n "$PROXY_HOST" ] && [ "$PROXY_HOST" != "" ] && [ -n "$PROXY_PORT" ] && [ "$PROXY_PORT" != "" ]; then
+                CHROME_PROXY_FLAG="--proxy-server=${PROXY_TYPE}://${PROXY_HOST}:${PROXY_PORT}"
+              fi
               google-chrome \
                 --no-first-run \
                 --no-default-browser-check \
                 --user-data-dir="$PROFILE_DIR" \
+                $CHROME_PROXY_FLAG \
                 2>/tmp/chrome-stderr.log &
               sleep 5
               if pgrep -f "google-chrome" > /dev/null; then
@@ -1040,6 +1086,52 @@ jobs:
           fi
 
           echo "✅ Webshare cleanup complete"
+
+      - name: Cleanup Tailscale
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 2
+        run: |
+          echo "Removing this device from tailnet..."
+
+          TAILSCALE_TOKEN="${{ steps.config.outputs.tailscale_token }}"
+
+          if [ -n "$TAILSCALE_TOKEN" ]; then
+            # Get this device's Tailscale IPv4 address
+            TARGET_IP=$(tailscale ip -4 2>/dev/null || echo "")
+
+            if [ -n "$TARGET_IP" ]; then
+              echo "This device IP: $TARGET_IP"
+
+              # Find and remove only this device by matching its IP
+              curl -s "https://api.tailscale.com/api/v2/tailnet/-/devices" \
+                --header "Authorization: Basic $TAILSCALE_TOKEN" | \
+                jq -r '.devices[] | "\(.id) \(.addresses[0])"' | \
+                while read id ip; do
+                  if [[ "$ip" == "$TARGET_IP" ]]; then
+                    echo "🗑️ Removing device with IP $ip (ID: $id)"
+                    curl -s -X DELETE "https://api.tailscale.com/api/v2/device/$id" \
+                      --header "Authorization: Basic $TAILSCALE_TOKEN"
+                    echo "✅ Removed device $id"
+                  fi
+                done
+            else
+              echo "⚠️ Could not get Tailscale IP, skipping API cleanup"
+            fi
+          else
+            echo "⚠️ Missing Tailscale token, skipping API cleanup"
+          fi
+
+          echo "Removing local Tailscale..."
+          sudo tailscale down || true
+          sudo apt-get remove -y tailscale || true
+          sudo apt-get autoremove -y || true
+          echo "✅ Tailscale cleanup complete"
+
+          echo "Removing local Tailscale..."
+          sudo tailscale down || true
+          sudo apt-get remove -y tailscale || true
+          sudo apt-get autoremove -y || true
+          echo "✅ Tailscale cleanup complete"
 
       - name: Cleanup VNC
         if: always() && steps.config.outputs.vnc_enabled == 'true'
