@@ -735,22 +735,51 @@ jobs:
           cloudflared --version
           echo "✅ cloudflared installed"
 
+      - name: Cleanup Existing Cloudflare Tunnel
+        if: steps.config.outputs.cloudflare_enabled == 'true'
+        run: |
+          echo "Checking for existing tunnel..."
+          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
+          echo "Tunnel name: $TUNNEL_NAME"
+
+          # List tunnels and find matching one
+          EXISTING_TUNNEL=$(curl -s --connect-timeout 10 --max-time 30 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel?name=${TUNNEL_NAME}" \
+            --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
+
+          if [ -n "$EXISTING_TUNNEL" ]; then
+            echo "Found existing tunnel: $EXISTING_TUNNEL - Deleting..."
+            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}" \
+              --request DELETE \
+              --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+            echo "Delete response: $DELETE_RESPONSE"
+            echo "✅ Old tunnel deleted"
+            sleep 2
+          else
+            echo "No existing tunnel found"
+          fi
+
       - name: Create Cloudflare Tunnel
         if: steps.config.outputs.cloudflare_enabled == 'true'
         id: tunnel
         run: |
           echo "Creating Cloudflare Tunnel..."
-          
+          TUNNEL_NAME="vnc-${{ steps.config.outputs.browser_profile_id }}"
+          echo "Tunnel name: $TUNNEL_NAME"
+
           RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
             -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel" \
             --request POST \
             --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" \
             --header "Content-Type: application/json" \
-            --data '{
-              "name": "github-vnc-'$(date +%s)'",
-              "config_src": "cloudflare"
-            }')
+            --data "{
+              \"name\": \"${TUNNEL_NAME}\",
+              \"config_src\": \"cloudflare\"
+            }")
           
           # Check if tunnel creation was successful
           SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
