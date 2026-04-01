@@ -25,7 +25,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
+
+      - name: Restore Cached Dependencies
+        if: steps.config.outputs.vnc_enabled == 'true'
+        uses: actions/cache@v4
+        id: deps-cache
+        with:
+          path: |
+            ~/cached-debs
+            ~/noVNC
+            ~/Downloads/real-botxbyte-extension
+            ~/.cache/pip
+          key: vnc-deps-v3-${{ runner.os }}
+          restore-keys: |
+            vnc-deps-v3-
+
       - name: Fetch and Parse Config
         id: config
         run: |
@@ -193,6 +207,12 @@ jobs:
         run: |
           echo "Installing XFCE desktop environment..."
 
+          # Check if already installed (key packages exist)
+          if command -v startxfce4 &> /dev/null && command -v xfce4-terminal &> /dev/null; then
+            echo "✅ XFCE already installed (cached)"
+            exit 0
+          fi
+
           # Kill unattended-upgrades to prevent dpkg lock contention
           sudo systemctl stop unattended-upgrades 2>/dev/null || true
           sudo killall -9 unattended-upgrades 2>/dev/null || true
@@ -225,13 +245,32 @@ jobs:
             ffmpeg \
             wmctrl
 
+          echo "✅ XFCE installed"
+
       - name: Install Google Chrome
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           echo "Installing Google Chrome..."
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
-          rm google-chrome-stable_current_amd64.deb
+
+          # Check if already installed
+          if command -v google-chrome &> /dev/null; then
+            echo "✅ Chrome already installed (cached)"
+            google-chrome --version
+            exit 0
+          fi
+
+          mkdir -p ~/cached-debs
+
+          # Use cached deb if available, otherwise download
+          if [ -f ~/cached-debs/google-chrome-stable_current_amd64.deb ]; then
+            echo "Using cached Chrome deb..."
+          else
+            echo "Downloading Chrome..."
+            wget -q -O ~/cached-debs/google-chrome-stable_current_amd64.deb \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          fi
+
+          sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           google-chrome --version
           echo "✅ Google Chrome installed"
 
@@ -284,18 +323,48 @@ jobs:
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           echo "Installing TurboVNC server..."
-          wget -q https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb
-          sudo dpkg -i turbovnc_2.2.5_amd64.deb
-          rm turbovnc_2.2.5_amd64.deb
+
+          # Check if already installed
+          if [ -x /opt/TurboVNC/bin/vncserver ]; then
+            echo "✅ TurboVNC already installed (cached)"
+            exit 0
+          fi
+
+          mkdir -p ~/cached-debs
+
+          # Use cached deb if available, otherwise download
+          if [ -f ~/cached-debs/turbovnc_2.2.5_amd64.deb ]; then
+            echo "Using cached TurboVNC deb..."
+          else
+            echo "Downloading TurboVNC..."
+            wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
+              https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb
+          fi
+
+          sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+          echo "✅ TurboVNC installed"
 
       - name: Install noVNC (Web VNC)
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           echo "Installing noVNC for web-based access..."
+
+          # Check if already cloned (from cache)
+          if [ -d ~/noVNC/utils ] && [ -d ~/noVNC/websockify ]; then
+            echo "✅ noVNC already installed (cached)"
+            exit 0
+          fi
+
           cd ~
-          git clone https://github.com/novnc/noVNC.git
+          if [ ! -d noVNC ]; then
+            git clone --depth 1 https://github.com/novnc/noVNC.git
+          fi
           cd noVNC
-          git clone https://github.com/novnc/websockify.git
+          if [ ! -d websockify ]; then
+            git clone --depth 1 https://github.com/novnc/websockify.git
+          fi
+
+          echo "✅ noVNC installed"
 
       - name: Configure VNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -356,14 +425,24 @@ jobs:
       - name: Download and Setup BotXByte Extension
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
-          echo "Downloading BotXByte extension..."
+          echo "Setting up BotXByte extension..."
 
-          # Install python3-venv
+          # Install python3-venv (usually fast, always needed)
           sudo apt-get install -y python3 python3-venv
 
           DOWNLOADS_DIR="$HOME/Downloads"
           EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
           mkdir -p "$DOWNLOADS_DIR"
+
+          # Check if extension already cached with venv
+          if [ -f "$EXTENSION_DIR/manifest.json" ] && [ -d "$EXTENSION_DIR/venv" ]; then
+            echo "✅ BotXByte Extension already cached"
+            echo "Extension contents:"
+            ls -la "$EXTENSION_DIR/"
+            exit 0
+          fi
+
+          echo "Downloading BotXByte extension..."
 
           # Download the extension zip
           wget -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
@@ -622,6 +701,13 @@ jobs:
         run: |
           echo "Installing cloudflared..."
 
+          # Check if already installed
+          if command -v cloudflared &> /dev/null; then
+            echo "✅ cloudflared already installed (cached)"
+            cloudflared --version
+            exit 0
+          fi
+
           # Release dpkg lock held by unattended-upgrades (may still be running
           # on a fresh Ubuntu runner if the VNC Desktop Environment step was skipped)
           sudo systemctl stop unattended-upgrades 2>/dev/null || true
@@ -634,9 +720,20 @@ jobs:
             sleep 5
           done
 
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
+          mkdir -p ~/cached-debs
+
+          # Use cached deb if available, otherwise download
+          if [ -f ~/cached-debs/cloudflared-linux-amd64.deb ]; then
+            echo "Using cached cloudflared deb..."
+          else
+            echo "Downloading cloudflared..."
+            wget -q -O ~/cached-debs/cloudflared-linux-amd64.deb \
+              https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          fi
+
+          sudo dpkg -i ~/cached-debs/cloudflared-linux-amd64.deb
           cloudflared --version
+          echo "✅ cloudflared installed"
 
       - name: Create Cloudflare Tunnel
         if: steps.config.outputs.cloudflare_enabled == 'true'
@@ -691,7 +788,7 @@ jobs:
                 \"ingress\": [
                   {
                     \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|\\\\d+).*\",
+                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|server-logs|\\\\d+).*\",
                     \"service\": \"http://localhost:8766\",
                     \"originRequest\": {}
                   },
@@ -861,7 +958,18 @@ jobs:
           echo "📦 Extension ready at: ~/Downloads/real-botxbyte-extension"
           echo "   Load it manually: Chrome > Extensions > Developer Mode > Load Unpacked"
           echo ""
-          
+
+      - name: Save Dependencies Cache
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/cached-debs
+            ~/noVNC
+            ~/Downloads/real-botxbyte-extension
+            ~/.cache/pip
+          key: vnc-deps-v3-${{ runner.os }}
+
       - name: Keep VNC Session Alive
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
