@@ -1334,3 +1334,44 @@ jobs:
           echo "  Size: $ZIP_SIZE"
 
           rm -f "/tmp/${BROWSER_PROFILE_ID}.zip"
+
+      - name: Trigger Auto-Restart
+        if: always() && steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 5
+        run: |
+          echo "Triggering auto-restart check..."
+
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          if [ -z "$BROWSER_PROFILE_ID" ] || [ "$BROWSER_PROFILE_ID" = "null" ]; then
+            echo "⚠️ No browser_profile_id, skipping auto-restart trigger"
+            exit 0
+          fi
+
+          # Call the auto-restart trigger endpoint
+          # Timeout is set to 180s to accommodate delay_seconds (default 30s) + github-management-service call time
+          echo "Calling auto-restart trigger for profile: $BROWSER_PROFILE_ID"
+
+          RESPONSE=$(curl -s --connect-timeout 30 --max-time 180 \
+            -X POST \
+            "http://129.212.196.173/ai-management-service/api/v1/browser-profile/auto-restart/trigger" \
+            -H "Content-Type: application/json" \
+            -H "user-id: ${USER_ID}" \
+            -H "workspace-id: ${WORKSPACE_ID}" \
+            -d "{\"profile_id\": \"${BROWSER_PROFILE_ID}\", \"reason\": \"timeout\"}")
+
+          echo "Auto-restart trigger response:"
+          echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+
+          # Check if restart was triggered
+          RESTARTED=$(echo "$RESPONSE" | jq -r '.data.restarted // false')
+          if [ "$RESTARTED" = "true" ]; then
+            echo "✅ Auto-restart triggered successfully"
+          else
+            REASON=$(echo "$RESPONSE" | jq -r '.data.reason // "unknown"')
+            echo "ℹ️ Auto-restart not triggered: $REASON"
+          fi
+
+          echo "✅ Auto-restart check complete"
