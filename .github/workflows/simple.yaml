@@ -26,20 +26,6 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Restore Cached Dependencies
-        if: steps.config.outputs.vnc_enabled == 'true'
-        uses: actions/cache@v4
-        id: deps-cache
-        with:
-          path: |
-            ~/cached-debs
-            ~/noVNC
-            ~/Downloads/real-botxbyte-extension
-            ~/.cache/pip
-          key: vnc-deps-v3-${{ runner.os }}
-          restore-keys: |
-            vnc-deps-v3-
-
       - name: Fetch and Parse Config
         id: config
         run: |
@@ -156,7 +142,21 @@ jobs:
           echo "  User ID: $USER_ID"
           echo "  Workspace ID: $WORKSPACE_ID"
           echo "  Profile Timeout: ${PROFILE_TIMEOUT_MINUTES} min"
-      
+
+      - name: Restore Cached Dependencies
+        if: steps.config.outputs.vnc_enabled == 'true'
+        uses: actions/cache@v4
+        id: deps-cache
+        with:
+          path: |
+            ~/cached-debs
+            ~/noVNC
+            ~/Downloads/real-botxbyte-extension
+            ~/.cache/pip
+          key: vnc-deps-v4-${{ runner.os }}
+          restore-keys: |
+            vnc-deps-v4-
+
       - name: Register IP with Webshare
         if: steps.config.outputs.webshare_enabled == 'true'
         id: webshare
@@ -202,77 +202,147 @@ jobs:
 
       
       - name: Install Desktop Environment
-        if: steps.config.outputs.vnc_enabled == 'true'
-        timeout-minutes: 5
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 18
         run: |
           echo "Installing XFCE desktop environment..."
 
-          # Check if already installed (key packages exist)
-          if command -v startxfce4 &> /dev/null && command -v xfce4-terminal &> /dev/null; then
-            echo "✅ XFCE already installed (cached)"
-            exit 0
+          install_desktop() {
+            # Kill unattended-upgrades to prevent dpkg lock contention
+            sudo systemctl stop unattended-upgrades 2>/dev/null || true
+            sudo killall -9 unattended-upgrades 2>/dev/null || true
+            sudo killall -9 dpkg 2>/dev/null || true
+
+            # Clean up any broken dpkg state
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+            sudo dpkg --configure -a 2>/dev/null || true
+
+            # Wait for any existing dpkg lock to release (max 60s)
+            for i in $(seq 1 12); do
+              if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+                break
+              fi
+              echo "Waiting for dpkg lock to release... ($i/12)"
+              sleep 5
+            done
+
+            # Enable parallel downloads
+            echo 'Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99parallel
+            echo 'APT::Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
+
+            # Use standard Ubuntu archive instead of Azure mirror
+            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list
+
+            sudo apt-get update -q
+
+            # Create cached-debs directory for parallel downloads
+            mkdir -p ~/cached-debs
+
+            # Start parallel downloads in background
+            echo "📥 Starting parallel downloads..."
+            (wget -q -O ~/cached-debs/google-chrome-stable_current_amd64.deb \
+              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && echo "✅ Chrome downloaded") &
+            PID_CHROME=$!
+
+            (wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
+              https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb && echo "✅ TurboVNC downloaded") &
+            PID_VNC=$!
+
+            (cd ~ && git clone --depth 1 https://github.com/novnc/noVNC.git && \
+              cd noVNC && git clone --depth 1 https://github.com/novnc/websockify.git && echo "✅ noVNC cloned") &
+            PID_NOVNC=$!
+
+            # Install XFCE while downloads happen in parallel
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              -o Dpkg::Options::="--force-confdef" \
+              -o Dpkg::Options::="--force-confold" \
+              xfce4 \
+              xfce4-terminal \
+              dbus-x11 \
+              x11-utils \
+              x11-xserver-utils \
+              xfonts-base \
+              ffmpeg \
+              wmctrl \
+              python3 \
+              python3-venv
+
+            echo "✅ XFCE installed"
+
+            # Wait for downloads and install
+            wait $PID_CHROME && sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
+            echo "✅ Chrome installed"
+
+            wait $PID_VNC && sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+            echo "✅ TurboVNC installed"
+
+            wait $PID_NOVNC
+            echo "✅ noVNC ready"
+          }
+
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          INSTALL_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            echo "📦 Installation attempt $RETRY_COUNT/$MAX_RETRIES..."
+
+            # Run installation with 5 minute timeout per attempt
+            if timeout 300 bash -c "$(declare -f install_desktop); install_desktop"; then
+              INSTALL_SUCCESS=true
+              break
+            else
+              echo "⚠️ Installation attempt $RETRY_COUNT failed"
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "🔄 Retrying in 30 seconds..."
+                sleep 30
+              fi
+            fi
+          done
+
+          if [ "$INSTALL_SUCCESS" = "true" ]; then
+            echo "✅ All dependencies installed"
+          else
+            echo "❌ Failed to install dependencies after $MAX_RETRIES attempts"
+            exit 1
           fi
 
-          # Kill unattended-upgrades to prevent dpkg lock contention
+      - name: Install from Cache (Fast Path)
+        if: steps.config.outputs.vnc_enabled == 'true' && steps.deps-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "📦 Installing from cache (fast path)..."
+
+          # Kill unattended-upgrades
           sudo systemctl stop unattended-upgrades 2>/dev/null || true
           sudo killall -9 unattended-upgrades 2>/dev/null || true
-          sudo killall -9 dpkg 2>/dev/null || true
 
-          # Wait for any existing dpkg lock to release (max 60s)
-          for i in $(seq 1 12); do
+          # Wait for dpkg lock
+          for i in $(seq 1 6); do
             if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
               break
             fi
-            echo "Waiting for dpkg lock to release... ($i/12)"
+            echo "Waiting for dpkg lock... ($i/6)"
             sleep 5
           done
 
-          # Enable parallel downloads
-          echo 'Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99parallel
-          echo 'APT::Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
-
-          sudo apt-get update -q
-
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            -o Dpkg::Options::="--force-confdef" \
-            -o Dpkg::Options::="--force-confold" \
-            xfce4 \
-            xfce4-terminal \
-            dbus-x11 \
-            x11-utils \
-            x11-xserver-utils \
-            xfonts-base \
-            ffmpeg \
-            wmctrl
-
-          echo "✅ XFCE installed"
-
-      - name: Install Google Chrome
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Installing Google Chrome..."
-
-          # Check if already installed
-          if command -v google-chrome &> /dev/null; then
-            echo "✅ Chrome already installed (cached)"
-            google-chrome --version
-            exit 0
+          # Install XFCE if not already installed
+          if ! command -v startxfce4 &> /dev/null; then
+            sudo apt-get update -q
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              xfce4 xfce4-terminal dbus-x11 x11-utils x11-xserver-utils xfonts-base ffmpeg wmctrl python3 python3-venv
           fi
 
-          mkdir -p ~/cached-debs
-
-          # Use cached deb if available, otherwise download
-          if [ -f ~/cached-debs/google-chrome-stable_current_amd64.deb ]; then
-            echo "Using cached Chrome deb..."
-          else
-            echo "Downloading Chrome..."
-            wget -q -O ~/cached-debs/google-chrome-stable_current_amd64.deb \
-              https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          # Install cached debs
+          if [ -f ~/cached-debs/google-chrome-stable_current_amd64.deb ] && ! command -v google-chrome &> /dev/null; then
+            sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
           fi
 
-          sudo dpkg -i ~/cached-debs/google-chrome-stable_current_amd64.deb || sudo apt-get install -f -y
-          google-chrome --version
-          echo "✅ Google Chrome installed"
+          if [ -f ~/cached-debs/turbovnc_2.2.5_amd64.deb ] && [ ! -x /opt/TurboVNC/bin/vncserver ]; then
+            sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
+          fi
+
+          echo "✅ Cache-based installation complete"
 
       - name: Install and Start Docker
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -319,53 +389,6 @@ jobs:
           tailscale status
           echo "✅ Tailscale is up"
 
-      - name: Install TurboVNC Server
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Installing TurboVNC server..."
-
-          # Check if already installed
-          if [ -x /opt/TurboVNC/bin/vncserver ]; then
-            echo "✅ TurboVNC already installed (cached)"
-            exit 0
-          fi
-
-          mkdir -p ~/cached-debs
-
-          # Use cached deb if available, otherwise download
-          if [ -f ~/cached-debs/turbovnc_2.2.5_amd64.deb ]; then
-            echo "Using cached TurboVNC deb..."
-          else
-            echo "Downloading TurboVNC..."
-            wget -q -O ~/cached-debs/turbovnc_2.2.5_amd64.deb \
-              https://phoenixnap.dl.sourceforge.net/project/turbovnc/2.2.5/turbovnc_2.2.5_amd64.deb
-          fi
-
-          sudo dpkg -i ~/cached-debs/turbovnc_2.2.5_amd64.deb
-          echo "✅ TurboVNC installed"
-
-      - name: Install noVNC (Web VNC)
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Installing noVNC for web-based access..."
-
-          # Check if already cloned (from cache)
-          if [ -d ~/noVNC/utils ] && [ -d ~/noVNC/websockify ]; then
-            echo "✅ noVNC already installed (cached)"
-            exit 0
-          fi
-
-          cd ~
-          if [ ! -d noVNC ]; then
-            git clone --depth 1 https://github.com/novnc/noVNC.git
-          fi
-          cd noVNC
-          if [ ! -d websockify ]; then
-            git clone --depth 1 https://github.com/novnc/websockify.git
-          fi
-
-          echo "✅ noVNC installed"
-
       - name: Configure VNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
@@ -394,18 +417,22 @@ jobs:
         run: |
           export PATH=$PATH:/opt/TurboVNC/bin
           echo "Starting TurboVNC server on display :1..."
-          
+
           vncserver :1 -geometry 1920x1080 -depth 24 -rfbport $VNC_PORT 2>&1 | tee /tmp/vnc-start.log
-          sleep 8
-          
-          if pgrep -f "Xvnc.*:1" > /dev/null; then
-            echo "✅ TurboVNC Server started successfully on port $VNC_PORT"
-            ps aux | grep Xvnc | grep -v grep
-          else
-            echo "❌ Failed to start VNC server"
-            cat /tmp/vnc-start.log
-            exit 1
-          fi
+
+          # Health check - wait up to 15s, exit early when ready
+          for i in $(seq 1 15); do
+            if pgrep -f "Xvnc.*:1" > /dev/null; then
+              echo "✅ TurboVNC Server started in ${i}s on port $VNC_PORT"
+              ps aux | grep Xvnc | grep -v grep
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ Failed to start VNC server"
+          cat /tmp/vnc-start.log
+          exit 1
 
       - name: Start noVNC (Web VNC)
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -413,22 +440,23 @@ jobs:
           echo "Starting noVNC web server..."
           cd ~/noVNC
           ./utils/novnc_proxy --vnc localhost:$VNC_PORT --listen $NOVNC_PORT &
-          sleep 3
-          
-          if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then
-            echo "✅ noVNC started successfully on port $NOVNC_PORT"
-          else
-            echo "❌ noVNC failed to start"
-            exit 1
-          fi
+
+          # Health check - wait up to 10s
+          for i in $(seq 1 10); do
+            if netstat -tuln | grep :$NOVNC_PORT > /dev/null; then
+              echo "✅ noVNC started in ${i}s on port $NOVNC_PORT"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ noVNC failed to start"
+          exit 1
 
       - name: Download and Setup BotXByte Extension
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
           echo "Setting up BotXByte extension..."
-
-          # Install python3-venv (usually fast, always needed)
-          sudo apt-get install -y python3 python3-venv
 
           DOWNLOADS_DIR="$HOME/Downloads"
           EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
@@ -749,15 +777,53 @@ jobs:
             --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}" | jq -r '.result[0].id // empty')
 
           if [ -n "$EXISTING_TUNNEL" ]; then
-            echo "Found existing tunnel: $EXISTING_TUNNEL - Deleting..."
-            DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+            echo "Found existing tunnel: $EXISTING_TUNNEL"
+
+            # First, try to clean up tunnel connections
+            echo "Cleaning up tunnel connections..."
+            CLEANUP_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
               -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}" \
+              "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}/connections" \
               --request DELETE \
               --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
-            echo "Delete response: $DELETE_RESPONSE"
-            echo "✅ Old tunnel deleted"
-            sleep 2
+            echo "Cleanup connections response: $CLEANUP_RESPONSE"
+
+            # Wait for connections to close
+            sleep 5
+
+            # Retry deletion with backoff
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            DELETE_SUCCESS=false
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DELETE_SUCCESS" != "true" ]; do
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              echo "Attempting to delete tunnel (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+
+              DELETE_RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+                -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                "https://api.cloudflare.com/client/v4/accounts/${{ steps.config.outputs.cloudflare_account_id }}/cfd_tunnel/${EXISTING_TUNNEL}" \
+                --request DELETE \
+                --header "Authorization: Bearer ${{ steps.config.outputs.cloudflare_api_token }}")
+
+              DELETE_SUCCESS=$(echo "$DELETE_RESPONSE" | jq -r '.success // false')
+
+              if [ "$DELETE_SUCCESS" = "true" ]; then
+                echo "✅ Old tunnel deleted successfully"
+              else
+                ERROR_MSG=$(echo "$DELETE_RESPONSE" | jq -r '.errors[0].message // "Unknown error"')
+                echo "⚠️ Delete attempt $RETRY_COUNT failed: $ERROR_MSG"
+                if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                  WAIT_TIME=$((RETRY_COUNT * 2))
+                  echo "Waiting ${WAIT_TIME} seconds before retry..."
+                  sleep $WAIT_TIME
+                fi
+              fi
+            done
+
+            if [ "$DELETE_SUCCESS" != "true" ]; then
+              echo "⚠️ Could not delete existing tunnel after $MAX_RETRIES attempts. Will try to create a new tunnel anyway."
+            fi
           else
             echo "No existing tunnel found"
           fi
@@ -909,15 +975,19 @@ jobs:
         run: |
           echo "Starting Cloudflare Tunnel..."
           cloudflared tunnel run --token ${{ steps.tunnel.outputs.tunnel_token }} > /tmp/tunnel.log 2>&1 &
-          sleep 10
-          
-          if ! pgrep -x "cloudflared" > /dev/null; then
-            echo "❌ Cloudflare tunnel failed to start"
-            cat /tmp/tunnel.log
-            exit 1
-          fi
-          
-          echo "✅ Cloudflare Tunnel started"
+
+          # Health check - wait up to 15s
+          for i in $(seq 1 15); do
+            if pgrep -x "cloudflared" > /dev/null; then
+              echo "✅ Cloudflare Tunnel started in ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "❌ Cloudflare tunnel failed to start"
+          cat /tmp/tunnel.log
+          exit 1
 
       - name: Register Tunnel URL with Backend
         if: steps.config.outputs.cloudflare_enabled == 'true'
@@ -997,7 +1067,7 @@ jobs:
             ~/noVNC
             ~/Downloads/real-botxbyte-extension
             ~/.cache/pip
-          key: vnc-deps-v3-${{ runner.os }}
+          key: vnc-deps-v4-${{ runner.os }}
 
       - name: Keep VNC Session Alive
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -1264,12 +1334,6 @@ jobs:
           sudo apt-get autoremove -y || true
           echo "✅ Tailscale cleanup complete"
 
-          echo "Removing local Tailscale..."
-          sudo tailscale down || true
-          sudo apt-get remove -y tailscale || true
-          sudo apt-get autoremove -y || true
-          echo "✅ Tailscale cleanup complete"
-
       - name: Cleanup VNC
         if: always() && steps.config.outputs.vnc_enabled == 'true'
         timeout-minutes: 1
@@ -1315,9 +1379,39 @@ jobs:
             exit 0
           fi
 
-          echo "Zipping browser profile: $PROFILE_DIR"
-          echo "  Profile size before zip: $(du -sh "$PROFILE_DIR" | cut -f1)"
+          echo "Cleaning up browser profile cache files..."
+          echo "  Profile size before cleanup: $(du -sh "$PROFILE_DIR" | cut -f1)"
 
+          # Remove Chrome cache directories to reduce upload size
+          find "$PROFILE_DIR" -type d \( \
+            -name "Cache" \
+            -o -name "Code Cache" \
+            -o -name "GPUCache" \
+            -o -name "ShaderCache" \
+            -o -name "GrShaderCache" \
+            -o -name "CacheStorage" \
+            -o -name "ScriptCache" \
+            -o -name "Service Worker" \
+            -o -name "blob_storage" \
+            -o -name "IndexedDB" \
+            -o -name "Session Storage" \
+            -o -name "Crashpad" \
+            -o -name "BrowserMetrics" \
+          \) -exec rm -rf {} + 2>/dev/null || true
+
+          # Remove large temporary/log files
+          find "$PROFILE_DIR" -type f \( \
+            -name "*.log" \
+            -o -name "*.tmp" \
+            -o -name "LOG" \
+            -o -name "LOG.old" \
+            -o -name "LOCK" \
+            -o -name "TransportSecurity" \
+          \) -delete 2>/dev/null || true
+
+          echo "  Profile size after cleanup: $(du -sh "$PROFILE_DIR" | cut -f1)"
+
+          echo "Zipping browser profile: $PROFILE_DIR"
           cd "$HOME/browser-profiles"
           zip -r "/tmp/${BROWSER_PROFILE_ID}.zip" "${BROWSER_PROFILE_ID}/" -x "*/SingletonLock" "*/SingletonCookie" "*/SingletonSocket"
 
