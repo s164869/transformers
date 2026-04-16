@@ -143,6 +143,41 @@ jobs:
           echo "  Workspace ID: $WORKSPACE_ID"
           echo "  Profile Timeout: ${PROFILE_TIMEOUT_MINUTES} min"
 
+      - name: Optimize APT Mirror and Network
+        if: steps.config.outputs.vnc_enabled == 'true'
+        timeout-minutes: 3
+        run: |
+          echo "Optimizing APT mirror and network settings..."
+
+          # Release possible dpkg lock holders on fresh runners
+          sudo systemctl stop unattended-upgrades 2>/dev/null || true
+          sudo killall -9 unattended-upgrades 2>/dev/null || true
+
+          # Add resilient APT networking defaults for CI
+          cat << 'EOF' | sudo tee /etc/apt/apt.conf.d/99ci-network >/dev/null
+          Acquire::Retries "6";
+          APT::Acquire::Retries "6";
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::http::Pipeline-Depth "0";
+          Acquire::ForceIPv4 "true";
+          Acquire::PDiffs "false";
+          EOF
+
+          # Ubuntu 24.04 runners usually use ubuntu.sources; switch away from Azure mirror.
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+            sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+          fi
+
+          if [ -f /etc/apt/sources.list ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+            sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+          fi
+
+          sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
+          echo "✅ APT optimization complete"
+
       - name: Restore Cached Dependencies
         if: steps.config.outputs.vnc_enabled == 'true'
         uses: actions/cache@v4
@@ -230,10 +265,19 @@ jobs:
             echo 'Acquire::Queue-Mode "access";' | sudo tee /etc/apt/apt.conf.d/99parallel
             echo 'APT::Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99parallel
 
-            # Use standard Ubuntu archive instead of Azure mirror
-            sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list
+            # Ubuntu 24.04 runners may use ubuntu.sources instead of sources.list.
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+              sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list.d/ubuntu.sources
+            fi
 
-            sudo apt-get update -q
+            # Use standard Ubuntu archive instead of Azure mirror
+            if [ -f /etc/apt/sources.list ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+              sudo sed -i 's|https://azure.archive.ubuntu.com/ubuntu|mirror://mirrors.ubuntu.com/mirrors.txt|g' /etc/apt/sources.list
+            fi
+
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
 
             # Create cached-debs directory for parallel downloads
             mkdir -p ~/cached-debs
@@ -328,7 +372,7 @@ jobs:
 
           # Install XFCE if not already installed
           if ! command -v startxfce4 &> /dev/null; then
-            sudo apt-get update -q
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               xfce4 xfce4-terminal dbus-x11 x11-utils x11-xserver-utils xfonts-base ffmpeg wmctrl python3 python3-venv
           fi
@@ -367,7 +411,7 @@ jobs:
           # Install docker compose plugin if not present
           if ! docker compose version &> /dev/null; then
             echo "Installing Docker Compose plugin..."
-            sudo apt-get update -q
+            sudo apt-get -o Acquire::Retries=6 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update -q
             sudo apt-get install -y docker-compose-plugin
           fi
 
