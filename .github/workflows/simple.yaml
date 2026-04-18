@@ -186,11 +186,10 @@ jobs:
           path: |
             ~/cached-debs
             ~/noVNC
-            ~/Downloads/real-botxbyte-extension
             ~/.cache/pip
-          key: vnc-deps-v4-${{ runner.os }}
+          key: vnc-deps-v5-${{ runner.os }}
           restore-keys: |
-            vnc-deps-v4-
+            vnc-deps-v5-
 
       - name: Register IP with Webshare
         if: steps.config.outputs.webshare_enabled == 'true'
@@ -506,13 +505,8 @@ jobs:
           EXTENSION_DIR="$DOWNLOADS_DIR/real-botxbyte-extension"
           mkdir -p "$DOWNLOADS_DIR"
 
-          # Check if extension already cached with venv
-          if [ -f "$EXTENSION_DIR/manifest.json" ] && [ -d "$EXTENSION_DIR/venv" ]; then
-            echo "✅ BotXByte Extension already cached"
-            echo "Extension contents:"
-            ls -la "$EXTENSION_DIR/"
-            exit 0
-          fi
+          # Always download fresh extension (remove any cached version)
+          rm -rf "$EXTENSION_DIR" 2>/dev/null || true
 
           echo "Downloading BotXByte extension..."
 
@@ -1109,9 +1103,8 @@ jobs:
           path: |
             ~/cached-debs
             ~/noVNC
-            ~/Downloads/real-botxbyte-extension
             ~/.cache/pip
-          key: vnc-deps-v4-${{ runner.os }}
+          key: vnc-deps-v5-${{ runner.os }}
 
       - name: Keep VNC Session Alive
         if: steps.config.outputs.vnc_enabled == 'true'
